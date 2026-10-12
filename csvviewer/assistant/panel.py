@@ -2,14 +2,16 @@
 import math
 import re
 
-from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFontDatabase, QGuiApplication, QPalette, QTextCharFormat, QTextCursor, QTextFormat, QTextFrameFormat, QTextOption
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QStackedWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
 )
 
 MODEL_LABEL = 'Haiku 5.5'
+PROVIDERS = [('claude', 'Claude'), ('gemini', 'Google Gemini (free)')]
+GEMINI_KEY_URL = 'https://aistudio.google.com/apikey'
 RENDER_MS = 50  # streamed text is re-rendered at most this often
 SUGGESTIONS = ['Summarize the current tab', 'What columns are there and what do they contain?',
                'Find anomalies or empty values']
@@ -276,6 +278,9 @@ class AssistantPanel(QWidget):
     newChatRequested = pyqtSignal()
     signInRequested = pyqtSignal()
     apiKeyEntered = pyqtSignal(str)
+    providerChanged = pyqtSignal(str)  # 'claude' or 'gemini'
+    geminiKeyEntered = pyqtSignal(str)
+    modelChosen = pyqtSignal(str)  # model id
     rowLinkClicked = pyqtSignal(int, int)  # tabId, row
 
     def __init__(self, parent=None):
@@ -287,6 +292,8 @@ class AssistantPanel(QWidget):
         self.busy = False
         self.stickBottom = True
         self.dots = 0
+        self.provider = 'claude'
+        self.providerCombos = []
         self.renderTimer = QTimer(self, singleShot=True, interval=RENDER_MS, timeout=self.flush)
         self.thinkTimer = QTimer(self, interval=400, timeout=self.animateThinking)
         self.stack = QStackedWidget()
@@ -297,21 +304,55 @@ class AssistantPanel(QWidget):
         lay.addWidget(self.stack)
         self.styleKey = None
         self.restyle()
+        self.setProvider('claude')
 
     # ---------- building ----------
+
+    def providerPicker(self):
+        # Compact provider combo; one sits on each page, kept in sync
+        combo = smaller(QComboBox())
+        for pid, label in PROVIDERS:
+            combo.addItem(label, pid)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        combo.setToolTip('Which AI answers your questions')
+        combo.activated.connect(lambda i, c=combo: self.onProviderPicked(c.itemData(i)))
+        self.providerCombos.append(combo)
+        return combo
 
     def buildSignIn(self):
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(10)
-        title = QLabel('Claude assistant')
-        font = title.font()
+        self.signInTitle = QLabel('Claude assistant')
+        font = self.signInTitle.font()
         font.setPointSizeF(font.pointSizeF() * 1.25)
         font.setBold(True)
-        title.setFont(font)
-        lay.addWidget(title)
+        self.signInTitle.setFont(font)
+        lay.addWidget(self.signInTitle)
         lay.addWidget(QLabel('Ask questions about your open CSV tabs.', wordWrap=True))
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QLabel('Provider', objectName='muted'))
+        row.addWidget(self.providerPicker())
+        row.addStretch()
+        lay.addLayout(row)
+        self.claudeBox = self.buildClaudeSignIn()
+        self.geminiBox = self.buildGeminiSignIn()
+        lay.addWidget(self.claudeBox)
+        lay.addWidget(self.geminiBox)
+        self.signInStatus = QLabel(objectName='muted', wordWrap=True)
+        self.signInStatus.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.signInStatus.hide()
+        lay.addWidget(self.signInStatus)
+        lay.addStretch()
+        return page
+
+    def buildClaudeSignIn(self):
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
         lay.addWidget(QLabel('Uses your own Claude API account; questions are billed to it. Only small samples '
                              'and query results are sent — never the whole file.', objectName='muted', wordWrap=True))
         lay.addSpacing(4)
@@ -333,32 +374,68 @@ class AssistantPanel(QWidget):
         row.addWidget(save)
         self.keyBox.hide()
         lay.addWidget(self.keyBox)
-        lay.addStretch()
-        return page
+        return box
+
+    def buildGeminiSignIn(self):
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        lay.addWidget(QLabel('<b>Free:</b> create a Gemini API key with your Google account — no payment card. '
+                             'Free-tier limits apply, and Google may use free-tier prompts to improve its products. '
+                             'Only small samples and query results are sent, never the whole file.',
+                             objectName='muted', wordWrap=True))
+        lay.addSpacing(4)
+        getKey = QPushButton('Get a free key', objectName='primary')
+        getKey.setCursor(Qt.CursorShape.PointingHandCursor)
+        getKey.setToolTip(GEMINI_KEY_URL)
+        getKey.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GEMINI_KEY_URL)))
+        lay.addWidget(getKey)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self.geminiKeyEdit = QLineEdit(placeholderText='Paste your Gemini API key', echoMode=QLineEdit.EchoMode.Password)
+        self.geminiKeyEdit.returnPressed.connect(self.saveGeminiKey)
+        save = QPushButton('Save')
+        save.clicked.connect(self.saveGeminiKey)
+        row.addWidget(self.geminiKeyEdit, 1)
+        row.addWidget(save)
+        lay.addLayout(row)
+        return box
 
     def buildChat(self):
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(8, 6, 8, 8)
         lay.setSpacing(6)
-        # header: title + model, New chat; auth label below
+        # header: title + provider, New chat; model + auth label below
         head = QHBoxLayout()
+        head.setSpacing(6)
         title = QLabel('Assistant')
         font = title.font()
         font.setBold(True)
         title.setFont(font)
-        self.modelLabel = smaller(QLabel(MODEL_LABEL, objectName='muted'))
         newChat = QToolButton(text='New chat', autoRaise=True)
         newChat.setToolTip('Start a new conversation')
         newChat.clicked.connect(self.newChatRequested)
         head.addWidget(title)
-        head.addWidget(self.modelLabel, 0, Qt.AlignmentFlag.AlignBaseline)
+        head.addWidget(self.providerPicker())
         head.addStretch()
         head.addWidget(newChat)
         lay.addLayout(head)
+        sub = QHBoxLayout()
+        sub.setSpacing(8)
+        self.modelLabel = smaller(QLabel(MODEL_LABEL, objectName='muted'))
+        self.modelCombo = smaller(QComboBox())
+        self.modelCombo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.modelCombo.setToolTip('Model')
+        self.modelCombo.activated.connect(lambda i: self.modelChosen.emit(self.modelCombo.itemData(i)))
+        self.modelCombo.hide()
         self.authLabel = smaller(QLabel(objectName='muted'))
         self.authLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        lay.addWidget(self.authLabel)
+        sub.addWidget(self.modelLabel)
+        sub.addWidget(self.modelCombo)
+        sub.addWidget(self.authLabel, 1)
+        lay.addLayout(sub)
         # message list
         self.scroll = QScrollArea(widgetResizable=True, objectName='list')
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -460,11 +537,46 @@ class AssistantPanel(QWidget):
             self.keyEdit.clear()
             self.apiKeyEntered.emit(key)
 
+    def saveGeminiKey(self):
+        key = self.geminiKeyEdit.text().strip()
+        if key:
+            self.geminiKeyEdit.clear()
+            self.geminiKeyEntered.emit(key)
+
+    def onProviderPicked(self, provider):
+        if provider != self.provider:
+            self.setProvider(provider)
+            self.providerChanged.emit(provider)
+
+    def setProvider(self, provider):
+        # Select the provider everywhere and switch the signed-out content; never emits providerChanged
+        self.provider = provider
+        for combo in self.providerCombos:
+            combo.setCurrentIndex(max(0, combo.findData(provider)))
+        gemini = provider == 'gemini'
+        self.signInTitle.setText('Gemini assistant' if gemini else 'Claude assistant')
+        self.claudeBox.setVisible(not gemini)
+        self.geminiBox.setVisible(gemini)
+
+    def setModelChoices(self, choices, current=''):
+        # choices: [(modelId, label)]; empty shows `current` as a plain label (a fixed model)
+        self.modelCombo.clear()
+        for modelId, label in choices:
+            self.modelCombo.addItem(label, modelId)
+        if choices:
+            self.modelCombo.setCurrentIndex(max(0, self.modelCombo.findData(current)))
+        else:
+            self.modelLabel.setText(current or '')
+        self.modelCombo.setVisible(bool(choices))
+        self.modelLabel.setVisible(not choices and bool(current))
+
     def setAuthState(self, signedIn, label=''):
         self.stack.setCurrentIndex(1 if signedIn else 0)
         self.authLabel.setText(label or '')
         self.authLabel.setToolTip(label or '')
         self.authLabel.setVisible(bool(signedIn and label))
+        self.signInStatus.setText(label or '')
+        self.signInStatus.setVisible(bool(not signedIn and label))
         if signedIn:
             self.input.setFocus()
 

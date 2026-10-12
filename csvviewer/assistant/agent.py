@@ -178,6 +178,7 @@ class Assistant(QObject):
     """Owns the Assistant dock: conversation state, sign-in, and the per-question worker."""
 
     antReady = pyqtSignal(str)  # path of the downloaded ant CLI, or "error:..."
+    keyChecked = pyqtSignal(bool, str, str)  # Gemini key check: ok, message, key
 
     def __init__(self, window):
         super().__init__(window)
@@ -187,6 +188,7 @@ class Assistant(QObject):
         self.worker = None
         self.tabWidgets = {}
         self.login = None
+        self.provider = auth.settings().value('assistant/provider', 'claude')
         self.panel = AssistantPanel()
         self.dock = QDockWidget('Assistant', window)
         self.dock.setObjectName('assistant')
@@ -194,7 +196,7 @@ class Assistant(QObject):
         window.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
         self.dock.hide()
         self.toggleAction = self.dock.toggleViewAction()
-        self.toggleAction.setText('&Assistant (Claude)')
+        self.toggleAction.setText('&Assistant')
         self.toggleAction.setShortcut(QKeySequence('Ctrl+Shift+A'))
         self.panel.askRequested.connect(self.ask)
         self.panel.stopRequested.connect(self.stop)
@@ -203,20 +205,58 @@ class Assistant(QObject):
         self.panel.apiKeyEntered.connect(self.useKey)
         self.panel.rowLinkClicked.connect(self.showRow)
         self.antReady.connect(self.runLogin)
+        self.panel.providerChanged.connect(self.setProvider)
+        self.panel.geminiKeyEntered.connect(self.useGeminiKey)
+        self.panel.modelChosen.connect(self.chooseModel)
+        self.keyChecked.connect(self.onKeyChecked)
+        self.panel.setProvider(self.provider)
         window.tabs.currentChanged.connect(self.updateContext)
         self.dock.visibilityChanged.connect(lambda shown: shown and (self.refreshAuth(), self.updateContext()))
         self.refreshAuth()
 
     def menuActions(self, menu):
         menu.addAction(self.toggleAction)
-        menu.addAction('Sign out of Claude', self.signOut)
+        menu.addAction('Sign out of the assistant', self.signOut)
 
     # ---------- sign-in ----------
 
     def refreshAuth(self):
-        signedIn, label = auth.authState()
+        from . import gemini
+        if self.provider == 'gemini':
+            signedIn, label = bool(gemini.savedKey()), 'Gemini key (free)'
+            self.panel.setModelChoices(gemini.MODELS, gemini.savedModel())
+        else:
+            signedIn, label = auth.authState()
+            self.panel.setModelChoices([], 'Haiku 5.5')
         self.panel.setAuthState(signedIn, label)
         return signedIn
+
+    def setProvider(self, provider):
+        if provider == self.provider:
+            return
+        # Histories are in each provider's own format, so switching starts a new chat
+        self.newChat()
+        self.provider = provider
+        auth.settings().setValue('assistant/provider', provider)
+        self.panel.setProvider(provider)
+        self.refreshAuth()
+
+    def useGeminiKey(self, key):
+        from . import gemini
+        self.panel.setAuthState(False, 'Checking the key with Google…')
+        threading.Thread(target=lambda: self.keyChecked.emit(*gemini.checkKey(key), key), daemon=True).start()
+
+    def onKeyChecked(self, ok, message, key):
+        from . import gemini
+        if ok:
+            gemini.saveKey(key)
+            self.refreshAuth()
+        else:
+            self.panel.setAuthState(False, message)
+
+    def chooseModel(self, model):
+        from . import gemini
+        gemini.saveModel(model)
 
     def useKey(self, key):
         if not key.strip().startswith('sk-'):
@@ -254,6 +294,11 @@ class Assistant(QObject):
             self.panel.setAuthState(False, f'Sign-in did not finish{": " + output.splitlines()[-1] if output else "."}')
 
     def signOut(self):
+        if self.provider == 'gemini':
+            from . import gemini
+            gemini.forgetKey()
+            self.refreshAuth()
+            return
         auth.forgetKey()
         ant = auth.findAnt()
         if ant:
@@ -280,8 +325,14 @@ class Assistant(QObject):
         self.panel.startAssistantMessage()
         self.panel.setBusy(True)
         # The worker gets its own copy; the conversation only advances when a question completes
-        messages = self.messages + [{'role': 'user', 'content': f'{contextBlock(tabs)}\n\n{question}'}]
-        self.worker = Worker(messages, CsvTools(tabs))
+        content = f'{contextBlock(tabs)}\n\n{question}'
+        if self.provider == 'gemini':
+            from . import gemini
+            history = self.messages or [{'role': 'system', 'content': SYSTEM}]
+            self.worker = gemini.GeminiWorker(history + [{'role': 'user', 'content': content}], CsvTools(tabs),
+                                              gemini.savedModel(), gemini.savedKey())
+        else:
+            self.worker = Worker(self.messages + [{'role': 'user', 'content': content}], CsvTools(tabs))
         self.worker.textDelta.connect(self.panel.appendText)
         self.worker.thinking.connect(self.panel.setThinking)
         self.worker.toolStarted.connect(self.panel.addToolChip)

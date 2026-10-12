@@ -842,7 +842,7 @@ class MainWindow(QMainWindow):
         self.assistant = Assistant(self)
         askButton = QToolButton(text='✦ Assistant')
         askButton.clicked.connect(self.assistant.toggleAction.trigger)
-        askButton.setToolTip('Ask Claude about the open tabs (Ctrl+Shift+A)')
+        askButton.setToolTip('Ask the AI assistant about the open tabs (Ctrl+Shift+A)')
         askButton.setAutoRaise(True)
         corner = QWidget()
         cornerLayout = QHBoxLayout(corner)
