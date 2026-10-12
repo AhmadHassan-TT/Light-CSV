@@ -5,7 +5,7 @@ import threading
 from bisect import bisect_left, bisect_right
 
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
+from PyQt6.QtGui import QActionGroup, QColor, QIcon, QKeySequence, QPalette, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
     QFileDialog, QFormLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
@@ -23,12 +23,51 @@ MAX_COPY_CELLS = 200_000
 SEGMENT = 50_000_000
 DELIMITERS = {'Auto': None, 'Comma ,': ',', 'Semicolon ;': ';', 'Tab': '\t', 'Pipe |': '|'}
 ENCODINGS = ['Auto', 'utf-8', 'cp1252', 'latin-1']
+THEMES = {'system': '&System', 'light': '&Light', 'dark': '&Dark'}
 
 
 def assetPath(name):
     # Assets sit next to the package in a checkout, or in the PyInstaller bundle dir
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     return os.path.join(base, 'assets', name)
+
+
+# Window, WindowText, Base, AlternateBase, Text, Button, ButtonText, Mid, Highlight, HighlightedText, disabled text
+PALETTES = {
+    'light': ('#f0f0f0', '#1a1a1a', '#ffffff', '#f5f5f5', '#1a1a1a', '#e6e6e6', '#1a1a1a', '#b4b4b4',
+              '#3070d8', '#ffffff', '#a0a0a0'),
+    'dark': ('#2b2b2b', '#e0e0e0', '#1e1e1e', '#262626', '#e0e0e0', '#333333', '#e0e0e0', '#555555',
+             '#2f65ca', '#ffffff', '#7a7a7a'),
+}
+
+
+def themePalette(theme):
+    window, windowText, base, altBase, text, button, buttonText, mid, highlight, highlightText, disabled =         PALETTES[theme]
+    Role = QPalette.ColorRole
+    palette = QPalette(QColor(button), QColor(window))  # derives Light / Midlight / Dark / Shadow from these
+    for role, color in ((Role.WindowText, windowText), (Role.Base, base), (Role.AlternateBase, altBase),
+                        (Role.Text, text), (Role.ButtonText, buttonText), (Role.Mid, mid),
+                        (Role.Highlight, highlight), (Role.HighlightedText, highlightText),
+                        (Role.ToolTipBase, base), (Role.ToolTipText, text), (Role.PlaceholderText, disabled),
+                        (Role.Link, highlight)):
+        palette.setColor(role, QColor(color))
+    for role in (Role.WindowText, Role.Text, Role.ButtonText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(disabled))
+    return palette
+
+
+def applyTheme(theme, systemStyle):
+    # Light and dark use Fusion with an explicit palette: the native Windows 10 style cannot draw dark
+    app = QApplication.instance()
+    hints = app.styleHints()
+    if hasattr(hints, 'setColorScheme'):  # Qt 6.8+: also themes native parts such as the title bar
+        hints.setColorScheme({'light': Qt.ColorScheme.Light, 'dark': Qt.ColorScheme.Dark}.get(theme, Qt.ColorScheme.Unknown))
+    if theme == 'system':
+        app.setStyle(systemStyle)
+        app.setPalette(QPalette())
+    else:
+        app.setStyle('Fusion')
+        app.setPalette(themePalette(theme))
 
 
 def samePath(a, b):
@@ -770,6 +809,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('CSV Viewer')
+        self.systemStyle = QApplication.style().name()
         self.resize(1500, 900)
         self.setAcceptDrops(True)
         self.settings = QSettings('csv-viewer', 'csv-viewer')
@@ -799,6 +839,7 @@ class MainWindow(QMainWindow):
         self.explorerDock.setWidget(self.explorer)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.explorerDock)
         self.buildMenus()
+        self.setTheme(self.settings.value('view/theme', 'system'))
         geometry = self.settings.value('window/geometry')
         if geometry is not None:
             self.restoreGeometry(geometry)
@@ -846,8 +887,27 @@ class MainWindow(QMainWindow):
         self.act(view, 'Go to &top', lambda: self.onTab('jumpTo', 0), 'Ctrl+Home')
         self.act(view, 'Go to &bottom', lambda: self.current() and self.current().jumpTo(self.current().model.virtualTotal() - 1), 'Ctrl+End')
         view.addSeparator()
+        themeMenu = view.addMenu('&Theme')
+        self.themeActions = QActionGroup(self)
+        for key, text in THEMES.items():
+            action = themeMenu.addAction(text)
+            action.setCheckable(True)
+            action.setData(key)
+            action.triggered.connect(lambda checked=False, k=key: self.setTheme(k))
+            self.themeActions.addAction(action)
+        self.act(themeMenu, '&Toggle light / dark',
+                 lambda: self.setTheme('light' if self.settings.value('view/theme') == 'dark' else 'dark'), 'Ctrl+Shift+L')
+        view.addSeparator()
         self.act(view, 'Ne&xt tab', lambda: self.cycleTab(1), [QKeySequence('Ctrl+Tab'), QKeySequence('Ctrl+PgDown')])
         self.act(view, 'Pre&vious tab', lambda: self.cycleTab(-1), [QKeySequence('Ctrl+Shift+Tab'), QKeySequence('Ctrl+PgUp')])
+
+    def setTheme(self, theme):
+        if theme not in THEMES:
+            theme = 'system'
+        applyTheme(theme, self.systemStyle)
+        self.settings.setValue('view/theme', theme)
+        for action in self.themeActions.actions():
+            action.setChecked(action.data() == theme)
 
     def act(self, menu, text, slot, shortcut=None):
         action = menu.addAction(text)

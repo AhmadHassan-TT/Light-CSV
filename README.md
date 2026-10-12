@@ -8,7 +8,19 @@ scroll while the file is still being indexed.
 
 ### Linux
 
-Requirements (system packages, no pip):
+**Option A: single binary (no Python needed).** Take `CSV-Viewer-linux-x86_64.tar.gz` from the
+GitHub Actions build artifacts (or a release), then:
+
+```bash
+tar -xzf CSV-Viewer-linux-x86_64.tar.gz
+./csv-viewer file.csv
+```
+
+It is built on Ubuntu 22.04 and runs on that or newer (glibc 2.35+). If it exits with a Qt "xcb"
+platform plugin error, install `sudo apt install libxcb-cursor0`. To build it yourself on Linux:
+`pip install -r requirements.txt pyinstaller && python build.py --onefile`.
+
+**Option B: from source.** Requirements (system packages, no pip):
 
 ```bash
 sudo apt install python3-pyqt6 python3-numpy
@@ -41,6 +53,10 @@ python build.py
 Unzip `dist\CSV-Viewer-windows-*.zip` anywhere and run `CSV Viewer.exe`. The exe is unsigned, so
 Windows SmartScreen may warn on first launch: **More info → Run anyway**. PyInstaller cannot
 cross-compile; `build.py` builds for the OS it runs on.
+
+To share a single file instead of a zip, build with `python build.py --onefile`. This gives you
+`dist\CSV Viewer.exe` (about 45 MB). It runs without Python or anything else installed, but each
+launch takes a few seconds longer because it unpacks itself to a temp folder first.
 
 **Option B: from source.** Install Python 3.12 (`winget install Python.Python.3.12`, or from
 python.org), then from the repo folder:
@@ -77,6 +93,8 @@ Each file opens in its own tab.
   **Show only matches** filters the view to matching rows; **Stop** cancels a running search.
 - **Export matching rows** to a new CSV.
 - **Cell detail panel** — shows the full value of the current cell.
+- **Light / dark theme** — **View ▸ Theme**: System, Light or Dark (Ctrl+Shift+L toggles). The
+  choice is remembered.
 - **Copy** — selection as tab-separated text, optionally with the header (max 200,000 cells).
 - **Hide / show columns** — right-click a header, or **View ▸ Columns…**
 - **Fit column widths** to content.
@@ -114,6 +132,7 @@ Each file opens in its own tab.
 | Ctrl+Shift+C | Copy selection with header |
 | Ctrl+Shift+H | Show / hide columns |
 | Ctrl+R | Fit column widths |
+| Ctrl+Shift+L | Toggle light / dark theme |
 
 ## Performance
 
