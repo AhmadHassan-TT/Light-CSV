@@ -145,6 +145,32 @@ def main():
     tab = NS(tabId=2, name='big.csv', index=NS(dataRows=1234), columns=['a', 'b'], indexed=False, current=True, searchTerm='x', searchHits=7)
     block = agent.contextBlock([tab])
     assert 'tab 2: big.csv - 1,234 rows, 2 columns, SQL view t2 (current tab), still indexing' in block and '(7 matching rows)' in block
+    # 6. Stop ends the question at once even while the stream is blocked
+    import threading
+    import time
+    gate = threading.Event()
+
+    class BlockingStream(FakeStream):
+        def __iter__(self):
+            gate.wait(10)
+            return iter(())
+
+    class BlockingClient(FakeClient):
+        def stream(self, **kwargs):
+            return BlockingStream(NS(stop_reason='end_turn', content=[]))
+    agent.auth.makeClient = lambda: BlockingClient([])
+    worker = agent.Worker([{'role': 'user', 'content': 'q'}], FakeTools())
+    finished = []
+    worker.finished.connect(lambda ok, msgs: finished.append(ok))
+    worker.start()
+    time.sleep(0.2)
+    worker.cancel()
+    QCoreApplication.processEvents()
+    assert finished == [False], finished
+    gate.set()
+    worker.thread.join(5)
+    QCoreApplication.processEvents()
+    assert finished == [False], finished
     print('all agent tests passed')
 
 

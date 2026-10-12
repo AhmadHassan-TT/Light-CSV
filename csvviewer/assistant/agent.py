@@ -78,14 +78,27 @@ class Worker(QObject):
         self.messages = messages
         self.tools = tools
         self.cancelled = False
+        self.done = False
+        self.doneLock = threading.Lock()
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def start(self):
         self.thread.start()
 
+    def finish(self, ok):
+        # Emitted once: by Stop right away, or when the loop ends
+        with self.doneLock:
+            if self.done:
+                return
+            self.done = True
+        self.thinking.emit(False)
+        self.finished.emit(ok and not self.cancelled, self.messages)
+
     def cancel(self):
         self.cancelled = True
         self.tools.cancel()
+        # A read blocked on the network can't always be interrupted, so the question ends now and the thread winds down alone
+        self.finish(False)
 
     def run(self):
         import anthropic
@@ -108,9 +121,8 @@ class Worker(QObject):
         except Exception as e:
             self.failed.emit(f'Error: {e}')
         finally:
-            self.thinking.emit(False)
             self.tools.close()
-            self.finished.emit(ok and not self.cancelled, self.messages)
+            self.finish(ok)
 
     def loop(self, client):
         definitions = self.tools.definitions()
@@ -345,7 +357,14 @@ class Assistant(QObject):
     def onFinished(self, ok, messages):
         if ok:
             self.messages = messages
-        self.worker = None
+        worker, self.worker = self.worker, None
+        if worker:
+            # A stopped worker may still be winding down; nothing it sends later should reach the panel
+            for signal in (worker.textDelta, worker.thinking, worker.toolStarted, worker.toolFinished, worker.uiAction, worker.failed, worker.finished):
+                try:
+                    signal.disconnect()
+                except TypeError:
+                    pass
         self.panel.endAssistantMessage()
         self.panel.setBusy(False)
 

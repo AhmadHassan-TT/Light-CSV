@@ -141,10 +141,14 @@ class GeminiWorker(QObject):
         self.key = key.strip()
         self.cancelled = False
         self.response = None
+        self.done = False
+        self.doneLock = threading.Lock()
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def start(self):
         self.thread.start()
+
+    finish = agent.Worker.finish
 
     def cancel(self):
         self.cancelled = True
@@ -160,6 +164,8 @@ class GeminiWorker(QObject):
             except Exception:
                 pass
         self.tools.cancel()
+        # On Windows the blocked read may only return at its timeout, so the question ends now
+        self.finish(False)
 
     def run(self):
         ok = False
@@ -176,9 +182,8 @@ class GeminiWorker(QObject):
                 self.failed.emit(f'Error: {e}')
         finally:
             self.response = None
-            self.thinking.emit(False)
             self.tools.close()
-            self.finished.emit(ok and not self.cancelled, self.messages)
+            self.finish(ok)
 
     def httpMessage(self, e):
         message, raw = errorInfo(e)

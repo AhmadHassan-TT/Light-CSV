@@ -181,9 +181,14 @@ def main():
     time.sleep(0.1)
     started = time.monotonic()
     worker.cancel()
-    worker.thread.join(5)
+    QCoreApplication.processEvents()
     elapsed = time.monotonic() - started
-    assert not worker.thread.is_alive() and elapsed < 2, elapsed
+    # The question ends at once even where the blocked read can't be interrupted (Windows); the thread winds down alone
+    assert ev['finished'] and ev['finished'][0][0] is False and elapsed < 2, (ev['finished'], elapsed)
+    RELEASE.set()
+    worker.thread.join(35)
+    QCoreApplication.processEvents()
+    assert len(ev['finished']) == 1 and not ev['errors'], ev
     QCoreApplication.processEvents()
     assert ev['finished'] and ev['finished'][0][0] is False and not ev['errors'] and tools.closed, ev
     RELEASE.set()
