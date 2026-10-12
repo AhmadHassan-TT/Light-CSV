@@ -486,13 +486,15 @@ class AssistantPanel(QWidget):
 
     def restyle(self):
         # Colors derive from the palette, so light, dark and system themes all fit; redone on theme change
-        p = self.palette()
+        # Read the app palette: a widget with a stylesheet no longer follows app palette changes by itself
+        p = QApplication.palette()
         base, text, hl = p.color(Role.Base), p.color(Role.Text), p.color(Role.Highlight)
         err = errorColor(p)
-        key = (base.name(), text.name(), hl.name())
+        key = (base.name(), text.name(), hl.name(), p.color(Role.Window).name(), p.color(Role.WindowText).name())
         if key == self.styleKey:
             return
         self.styleKey = key
+        self.setPalette(p)  # labels, inputs and text views take their text colors from here
         c = lambda col: col.name()
         self.setStyleSheet(f"""
             QScrollArea#list {{ border: 1px solid {c(mix(base, text, 0.18))}; border-radius: 6px; }}
@@ -520,7 +522,7 @@ class AssistantPanel(QWidget):
 
     def changeEvent(self, event):
         super().changeEvent(event)
-        if event.type() == QEvent.Type.PaletteChange:
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.StyleChange):
             self.restyle()
 
     # ---------- signed-out view ----------

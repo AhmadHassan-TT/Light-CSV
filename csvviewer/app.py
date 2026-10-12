@@ -919,6 +919,8 @@ class MainWindow(QMainWindow):
         if theme not in THEMES:
             theme = 'system'
         applyTheme(theme, self.systemStyle)
+        if hasattr(self, 'assistant'):
+            self.assistant.panel.restyle()
         self.settings.setValue('view/theme', theme)
         for action in self.themeActions.actions():
             action.setChecked(action.data() == theme)
