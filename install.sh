@@ -17,6 +17,14 @@ if ! python3 -c 'import PyQt6.QtWidgets, numpy' 2>/dev/null; then
     echo "(continuing with the install; the app will not start until these are present)"
 fi
 
+# Assistant packages (anthropic, duckdb) go in a .venv that still sees the system PyQt6 and numpy
+if python3 -m venv --help >/dev/null 2>&1; then
+    [ -x "$repo/.venv/bin/python" ] || python3 -m venv --system-site-packages "$repo/.venv"
+    "$repo/.venv/bin/pip" install -q --upgrade anthropic duckdb || echo "Could not install the assistant packages; the viewer still works."
+else
+    echo "python3-venv is missing, so the Assistant panel is unavailable: sudo apt install python3-venv python3-pip"
+fi
+
 mkdir -p "$binDir" "$appsDir" "$iconDir"
 chmod +x "$repo/csvview"
 

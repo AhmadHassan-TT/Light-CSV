@@ -145,6 +145,15 @@ Measured on an 11 GB file with 160.6 million rows:
 | Whole-file search | 4–8 s |
 | Memory | ~230 MB |
 
+## Assistant (Claude)
+
+Ask questions about the open tabs in plain language: **✦ Assistant** (top right) or **Ctrl+Shift+A** opens the panel on the right.
+
+- **Sign in once** with your own Claude API account: press **Sign in with Claude** (opens your browser; uses Anthropic's official `ant` CLI, downloaded automatically if missing), or paste an API key. Usage is billed to that account; the model is Claude Haiku 5.5 (low cost). View ▸ Sign out of Claude forgets it.
+- **What leaves your PC:** only small samples and query results - never the file. Claude works through local tools: list tabs, sample rows, read rows, search, **SQL over the whole file (DuckDB; tab N is view `tN`)**, and jump to rows. Each step shows as a chip you can expand.
+- Answers link rows like *row 7*: click to jump there. **Stop** cancels a running query; **New chat** starts fresh.
+- Requires the `anthropic` and `duckdb` packages: `./install.sh` puts them in `.venv` (Linux), `install-windows.ps1` installs them, and the standalone builds include them. Without them the viewer works and the panel says what is missing.
+
 ## Limitations
 
 - Read-only; no editing.

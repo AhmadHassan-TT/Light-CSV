@@ -826,7 +826,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCornerWidget(newTab, Qt.Corner.TopRightCorner)
         welcome = QLabel('<h2>CSV Viewer</h2><p>Open a CSV file: double-click one in the Explorer on the left,<br>'
                          'use File ▸ Open (Ctrl+O), or drag files onto this window.</p>'
-                         '<p>Each file opens in its own tab.</p>')
+                         '<p>Each file opens in its own tab. Ask Claude about them with ✦ Assistant (Ctrl+Shift+A).</p>')
         welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.stack = QStackedWidget()
         self.stack.addWidget(welcome)
@@ -838,6 +838,19 @@ class MainWindow(QMainWindow):
         self.explorerDock.setObjectName('explorer')
         self.explorerDock.setWidget(self.explorer)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.explorerDock)
+        from .assistant.agent import Assistant
+        self.assistant = Assistant(self)
+        askButton = QToolButton(text='✦ Assistant')
+        askButton.clicked.connect(self.assistant.toggleAction.trigger)
+        askButton.setToolTip('Ask Claude about the open tabs (Ctrl+Shift+A)')
+        askButton.setAutoRaise(True)
+        corner = QWidget()
+        cornerLayout = QHBoxLayout(corner)
+        cornerLayout.setContentsMargins(0, 0, 4, 0)
+        cornerLayout.setSpacing(2)
+        cornerLayout.addWidget(askButton)
+        cornerLayout.addWidget(self.tabs.cornerWidget(Qt.Corner.TopRightCorner))
+        self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
         self.buildMenus()
         self.setTheme(self.settings.value('view/theme', 'system'))
         geometry = self.settings.value('window/geometry')
@@ -875,6 +888,7 @@ class MainWindow(QMainWindow):
         explorerAct.setText('&Explorer panel')
         explorerAct.setShortcut('F4')
         view.addAction(explorerAct)
+        self.assistant.menuActions(view)
         self.detailAct = view.addAction('Cell &detail panel')
         self.detailAct.setShortcut('Ctrl+D')
         self.detailAct.setCheckable(True)
@@ -1001,6 +1015,7 @@ class MainWindow(QMainWindow):
                 self.openPath(url.toLocalFile())
 
     def closeEvent(self, event):
+        self.assistant.shutdown()
         self.settings.setValue('window/geometry', self.saveGeometry())
         self.settings.setValue('window/state', self.saveState())
         while self.tabs.count():
