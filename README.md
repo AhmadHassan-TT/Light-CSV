@@ -145,11 +145,12 @@ Measured on an 11 GB file with 160.6 million rows:
 | Whole-file search | 4–8 s |
 | Memory | ~230 MB |
 
-## Assistant (Claude or free Google Gemini)
+## Assistant (Claude, or free Google Gemini / Groq)
 
 Ask questions about the open tabs in plain language: **✦ Assistant** (top right) or **Ctrl+Shift+A** opens the panel on the right. Pick the AI at the top of the panel:
 
 - **Google Gemini (free):** press **Get a free key** (aistudio.google.com, Google account, no payment card), paste the key, done. Free-tier limits apply (per minute and per day), and Google may use free-tier prompts to improve its products. Default model Gemini 3.8 Flash; Gemini 3.5 Flash-Lite is faster with higher free limits.
+- **Groq (free):** press **Get a free key** (console.groq.com, sign up with email, Google or GitHub, no payment card), paste the key. Models: GPT-OSS 120B (default), GPT-OSS 20B (faster), Llama 3.3 70B. The free plan allows about 30 requests a minute and 1,000 a day with a small per-minute token budget, so long questions may pause for a minute.
 - **Claude:** sign in with your own Claude API account: press **Sign in with Claude** (opens your browser; uses Anthropic's official `ant` CLI, downloaded automatically if missing), or paste an API key. Usage is billed to that account; the model is Claude Haiku 5.5 (low cost).
 - View ▸ Sign out of the assistant forgets the current provider's key or sign-in.
 - **History:** every chat is saved automatically. **◷ History** reopens one (you can keep asking in it), deletes the current chat, or clears all. Chats are stored on this PC only.

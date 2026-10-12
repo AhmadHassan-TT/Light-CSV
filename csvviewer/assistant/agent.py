@@ -7,6 +7,7 @@ from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import QDockWidget, QMessageBox
 
 from . import auth, history
+from .providers import KEY_PROVIDERS
 from .context import snapshotTabs
 
 MODEL = 'claude-haiku-5-5'
@@ -190,7 +191,7 @@ class Assistant(QObject):
     """Owns the Assistant dock: conversation state, sign-in, and the per-question worker."""
 
     antReady = pyqtSignal(str)  # path of the downloaded ant CLI, or "error:..."
-    keyChecked = pyqtSignal(bool, str, str)  # Gemini key check: ok, message, key
+    keyChecked = pyqtSignal(str, bool, str, str)  # free-key check: providerId, ok, message, key
 
     def __init__(self, window):
         super().__init__(window)
@@ -219,7 +220,8 @@ class Assistant(QObject):
         self.panel.rowLinkClicked.connect(self.showRow)
         self.antReady.connect(self.runLogin)
         self.panel.providerChanged.connect(self.setProvider)
-        self.panel.geminiKeyEntered.connect(self.useGeminiKey)
+        self.panel.providerKeyEntered.connect(self.useProviderKey)
+        self.panel.setProviders([('claude', 'Claude')] + [(p.id, f'{p.name} (free)') for p in KEY_PROVIDERS.values()])
         self.panel.modelChosen.connect(self.chooseModel)
         self.keyChecked.connect(self.onKeyChecked)
         self.panel.chatOpened.connect(self.openChat)
@@ -239,11 +241,16 @@ class Assistant(QObject):
 
     # ---------- sign-in ----------
 
+    def keyProvider(self):
+        return KEY_PROVIDERS.get(self.provider)
+
     def refreshAuth(self):
-        from . import gemini
-        if self.provider == 'gemini':
-            signedIn, label = bool(gemini.savedKey()), 'Gemini key (free)'
-            self.panel.setModelChoices(gemini.MODELS, gemini.savedModel())
+        provider = self.keyProvider()
+        if provider:
+            self.panel.setKeyProvider({'id': provider.id, 'name': provider.name, 'signupText': provider.signupText,
+                                       'keyUrl': provider.keyUrl, 'keyPlaceholder': provider.keyPlaceholder})
+            signedIn, label = bool(provider.savedKey()), f'{provider.name} key (free)'
+            self.panel.setModelChoices(provider.models, provider.savedModel())
         else:
             signedIn, label = auth.authState()
             self.panel.setModelChoices([], 'Haiku 5.5')
@@ -260,22 +267,22 @@ class Assistant(QObject):
         self.panel.setProvider(provider)
         self.refreshAuth()
 
-    def useGeminiKey(self, key):
+    def useProviderKey(self, providerId, key):
         from . import gemini
-        self.panel.setAuthState(False, 'Checking the key with Google…')
-        threading.Thread(target=lambda: self.keyChecked.emit(*gemini.checkKey(key), key), daemon=True).start()
+        provider = KEY_PROVIDERS[providerId]
+        self.panel.setAuthState(False, f'Checking the key with {provider.company}…')
+        threading.Thread(target=lambda: self.keyChecked.emit(providerId, *gemini.checkKey(provider, key), key), daemon=True).start()
 
-    def onKeyChecked(self, ok, message, key):
-        from . import gemini
+    def onKeyChecked(self, providerId, ok, message, key):
         if ok:
-            gemini.saveKey(key)
+            KEY_PROVIDERS[providerId].saveKey(key)
             self.refreshAuth()
-        else:
+        elif providerId == self.provider:
             self.panel.setAuthState(False, message)
 
     def chooseModel(self, model):
-        from . import gemini
-        gemini.saveModel(model)
+        if self.keyProvider():
+            self.keyProvider().saveModel(model)
 
     def useKey(self, key):
         if not key.strip().startswith('sk-'):
@@ -313,9 +320,8 @@ class Assistant(QObject):
             self.panel.setAuthState(False, f'Sign-in did not finish{": " + output.splitlines()[-1] if output else "."}')
 
     def signOut(self):
-        if self.provider == 'gemini':
-            from . import gemini
-            gemini.forgetKey()
+        if self.keyProvider():
+            self.keyProvider().forgetKey()
             self.refreshAuth()
             return
         auth.forgetKey()
@@ -345,17 +351,16 @@ class Assistant(QObject):
         self.panel.setBusy(True)
         # The worker gets its own copy; the conversation only advances when a question completes
         content = f'{contextBlock(tabs)}\n\n{question}'
+        provider = self.keyProvider()
         if self.chat is None:
-            from . import gemini
-            model = 'Haiku 5.5' if self.provider == 'claude' else gemini.savedModel()
-            self.chat = history.newChat(self.provider, model, question)
+            self.chat = history.newChat(self.provider, provider.savedModel() if provider else 'Haiku 5.5', question)
         self.record('user', question)
         self.record('start')
-        if self.provider == 'gemini':
+        if provider:
             from . import gemini
             earlier = self.messages or [{'role': 'system', 'content': SYSTEM}]
-            self.worker = gemini.GeminiWorker(earlier + [{'role': 'user', 'content': content}], CsvTools(tabs),
-                                              gemini.savedModel(), gemini.savedKey())
+            self.worker = gemini.ChatWorker(provider, earlier + [{'role': 'user', 'content': content}], CsvTools(tabs),
+                                            provider.savedModel(), provider.savedKey())
         else:
             self.worker = Worker(self.messages + [{'role': 'user', 'content': content}], CsvTools(tabs))
         self.worker.textDelta.connect(self.panel.appendText)

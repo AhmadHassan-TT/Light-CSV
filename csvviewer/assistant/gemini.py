@@ -1,60 +1,28 @@
-"""Free alternative to Claude: Google Gemini through its OpenAI-compatible API, streamed with urllib on a worker thread."""
+"""OpenAI-compatible providers (Gemini, Groq): chat streamed with urllib on a worker thread."""
 import json
 import socket
 import threading
 import urllib.error
 import urllib.request
 
-from PyQt6.QtCore import QObject, QSettings, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 
 from . import agent
 
-BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/'
-MODELS = [('gemini-3.8-flash', 'Gemini 3.8 Flash'),
-          ('gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite (fastest, highest free limits)'),
-          ('gemini-2.5-flash', 'Gemini 2.5 Flash')]
-DEFAULT_MODEL = 'gemini-3.8-flash'
-KEY_URL = 'https://aistudio.google.com/apikey'
-KEY_SETTING = 'assistant/geminiKey'
-MODEL_SETTING = 'assistant/geminiModel'
 TIMEOUT = 120
 
 
-def settings():
-    return QSettings('csv-viewer', 'csv-viewer')
-
-
-def savedKey():
-    return settings().value(KEY_SETTING, '') or ''
-
-
-def saveKey(key):
-    settings().setValue(KEY_SETTING, key.strip())
-
-
-def forgetKey():
-    settings().remove(KEY_SETTING)
-
-
-def savedModel():
-    return settings().value(MODEL_SETTING, '') or DEFAULT_MODEL
-
-
-def saveModel(model):
-    settings().setValue(MODEL_SETTING, model)
-
-
-def request(path, key, body=None, timeout=TIMEOUT):
-    """Open a GET (no body) or JSON POST to the Gemini endpoint; read BASE_URL at call time so tests can point it elsewhere."""
+def request(provider, path, key, body=None, timeout=TIMEOUT):
+    """Open a GET (no body) or JSON POST to the provider; baseUrl is read at call time."""
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(BASE_URL + path, data=data, headers={'Authorization': f'Bearer {key}'})
+    req = urllib.request.Request(provider.baseUrl + path, data=data, headers={'Authorization': f'Bearer {key}'})
     if data is not None:
         req.add_header('Content-Type', 'application/json')
     return urllib.request.urlopen(req, timeout=timeout)
 
 
 def errorInfo(e):
-    """(Google's error message, raw body) from an HTTPError; the body is a dict or a list of dicts."""
+    """(provider's error message, raw body) from an HTTPError; the body is a dict or a list of dicts."""
     try:
         raw = e.read().decode(errors='replace')
     except Exception:
@@ -70,28 +38,46 @@ def errorInfo(e):
 
 
 def keyRejected(e, raw):
-    return e.code in (401, 403) or (e.code == 400 and 'API_KEY_INVALID' in raw)
+    return e.code in (401, 403) or 'API_KEY_INVALID' in raw or 'invalid_api_key' in raw
 
 
-def checkKey(key):
+def unreachable(provider, e):
+    return f'Could not reach {provider.company}: {getattr(e, "reason", e)}. Check your internet connection.'
+
+
+def httpMessage(provider, e):
+    """User-facing message for an HTTP error from a chat request."""
+    message, raw = errorInfo(e)
+    if keyRejected(e, raw):
+        return f'{provider.company} rejected the {provider.name} API key. Check it, or get a new one at {provider.keyUrl}'
+    if e.code == 429:
+        return f'The free {provider.name} limit is used up for now. {provider.limitHint}'.strip()
+    if e.code == 404:
+        return f'This {provider.name} model is not available to your key: {message}'
+    if e.code == 400 and 'tool_use_failed' in raw:
+        return 'The model produced an invalid tool call. Ask again, or try another model.'
+    return f'{provider.name} API error {e.code}: {message}'
+
+
+def checkKey(provider, key):
     """(ok, message) after listing models with the key; blocking, call off the GUI thread."""
     try:
-        with request('models', key.strip(), timeout=10) as resp:
+        with request(provider, 'models', key.strip(), timeout=10) as resp:
             resp.read()
-        return True, 'The Gemini API key works.'
+        return True, f'The {provider.name} API key works.'
     except urllib.error.HTTPError as e:
         message, raw = errorInfo(e)
         if keyRejected(e, raw):
-            return False, f'Google rejected this API key. Copy it again from {KEY_URL}'
+            return False, f'{provider.company} rejected this API key. Copy it again from {provider.keyUrl}'
         if e.code == 429:
-            return False, 'The key works, but the free Gemini limit is used up for now. Wait a minute.'
-        return False, f'Google returned error {e.code}: {message}'
+            return False, f'The key works, but the free {provider.name} limit is used up for now. {provider.limitHint}'.strip()
+        return False, f'{provider.company} returned error {e.code}: {message}'
     except (urllib.error.URLError, OSError) as e:
-        return False, f'Could not reach Google: {getattr(e, "reason", e)}. Check your internet connection.'
+        return False, unreachable(provider, e)
 
 
 def cleanSchema(schema):
-    """Copy of a JSON schema without additionalProperties, which Gemini's function schemas may reject."""
+    """Copy of a JSON schema without additionalProperties, which some providers (Gemini) reject."""
     if isinstance(schema, dict):
         return {k: cleanSchema(v) for k, v in schema.items() if k != 'additionalProperties'}
     if isinstance(schema, list):
@@ -99,10 +85,12 @@ def cleanSchema(schema):
     return schema
 
 
-def openaiTools(definitions):
+def openaiTools(definitions, provider):
     """Anthropic tool dicts -> OpenAI function tools (strict and cache fields dropped)."""
-    return [{'type': 'function', 'function': {'name': d['name'], 'description': d.get('description', ''),
-                                              'parameters': cleanSchema(d.get('input_schema') or {'type': 'object', 'properties': {}})}}
+    def params(d):
+        schema = d.get('input_schema') or {'type': 'object', 'properties': {}}
+        return cleanSchema(schema) if provider.stripAdditionalProperties else schema
+    return [{'type': 'function', 'function': {'name': d['name'], 'description': d.get('description', ''), 'parameters': params(d)}}
             for d in definitions]
 
 
@@ -122,8 +110,8 @@ def mergeCall(call, piece):
             call[k] = v
 
 
-class GeminiWorker(QObject):
-    """One question: streams Gemini's answer and runs the tools it asks for. Same signals as agent.Worker."""
+class ChatWorker(QObject):
+    """One question: streams the provider's answer and runs the tools it asks for. Same signals as agent.Worker."""
 
     textDelta = pyqtSignal(str)
     thinking = pyqtSignal(bool)
@@ -133,11 +121,12 @@ class GeminiWorker(QObject):
     failed = pyqtSignal(str)
     finished = pyqtSignal(bool, list)  # ok, the conversation including this question's turns
 
-    def __init__(self, messages, tools, model, key):
+    def __init__(self, provider, messages, tools, model, key):
         super().__init__()
+        self.provider = provider
         self.messages = messages
         self.tools = tools
-        self.model = model or DEFAULT_MODEL
+        self.model = model or provider.defaultModel
         self.key = key.strip()
         self.cancelled = False
         self.response = None
@@ -177,10 +166,10 @@ class GeminiWorker(QObject):
             ok = self.loop()
         except urllib.error.HTTPError as e:
             if not self.cancelled:
-                self.failed.emit(self.httpMessage(e))
+                self.failed.emit(httpMessage(self.provider, e))
         except (urllib.error.URLError, OSError) as e:
             if not self.cancelled:
-                self.failed.emit(f'Could not reach Google: {getattr(e, "reason", e)}. Check your internet connection.')
+                self.failed.emit(unreachable(self.provider, e))
         except Exception as e:
             if not self.cancelled:
                 self.failed.emit(f'Error: {e}')
@@ -189,25 +178,14 @@ class GeminiWorker(QObject):
             self.tools.close()
             self.finish(ok)
 
-    def httpMessage(self, e):
-        message, raw = errorInfo(e)
-        if keyRejected(e, raw):
-            return f'Google rejected the Gemini API key. Check it, or get a new one at {KEY_URL}'
-        if e.code == 429:
-            return ('The free Gemini limit is used up for now (requests per minute or per day). Wait a minute, '
-                    'or pick Gemini 3.5 Flash-Lite, which has higher free limits.')
-        if e.code == 404:
-            return f'This Gemini model is not available to your key: {message}'
-        return f'Gemini API error {e.code}: {message}'
-
     def loop(self):
-        tools = openaiTools(self.tools.definitions())
+        tools = openaiTools(self.tools.definitions(), self.provider)
         for _ in range(agent.MAX_TURNS):
             if self.cancelled:
                 return False
             self.thinking.emit(True)
             body = {'model': self.model, 'messages': self.messages, 'tools': tools, 'tool_choice': 'auto',
-                    'stream': True, 'reasoning_effort': 'low'}
+                    'stream': True, **self.provider.extraBody(self.model)}
             text, calls, finish, extra = self.stream(body)
             if self.cancelled:
                 return False
@@ -232,7 +210,7 @@ class GeminiWorker(QObject):
     def stream(self, body):
         """One streamed request -> (text, tool calls in order, finish reason, message-level extra_content)."""
         text, calls, order, finish, extra = [], {}, [], None, None
-        self.response = request('chat/completions', self.key, body)
+        self.response = request(self.provider, 'chat/completions', self.key, body)
         try:
             for line in self.response:
                 if self.cancelled:

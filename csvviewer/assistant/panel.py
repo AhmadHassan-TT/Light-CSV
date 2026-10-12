@@ -10,8 +10,9 @@ from PyQt6.QtWidgets import (
 )
 
 MODEL_LABEL = 'Haiku 5.5'
-PROVIDERS = [('claude', 'Claude'), ('gemini', 'Google Gemini (free)')]
-GEMINI_KEY_URL = 'https://aistudio.google.com/apikey'
+PROVIDERS = [('claude', 'Claude'), ('gemini', 'Google Gemini (free)'), ('groq', 'Groq (free)')]
+SHORT_NAMES = {'gemini': 'Gemini', 'groq': 'Groq'}  # history marker per provider; none for Claude
+PRIVACY_NOTE = ' Only small samples and query results are sent, never the whole file.'
 RENDER_MS = 50  # streamed text is re-rendered at most this often
 SUGGESTIONS = ['Summarize the current tab', 'What columns are there and what do they contain?',
                'Find anomalies or empty values']
@@ -281,8 +282,8 @@ class AssistantPanel(QWidget):
     newChatRequested = pyqtSignal()
     signInRequested = pyqtSignal()
     apiKeyEntered = pyqtSignal(str)
-    providerChanged = pyqtSignal(str)  # 'claude' or 'gemini'
-    geminiKeyEntered = pyqtSignal(str)
+    providerChanged = pyqtSignal(str)  # provider id, e.g. 'claude', 'gemini', 'groq'
+    providerKeyEntered = pyqtSignal(str, str)  # providerId, key
     modelChosen = pyqtSignal(str)  # model id
     rowLinkClicked = pyqtSignal(int, int)  # tabId, row
     chatOpened = pyqtSignal(str)  # chat id the user picked
@@ -301,6 +302,8 @@ class AssistantPanel(QWidget):
         self.dots = 0
         self.provider = 'claude'
         self.providerCombos = []
+        self.providers = list(PROVIDERS)
+        self.keyProvider = {}  # info dict of the key provider shown signed out
         self.historyItems = []
         self.currentChat = None
         self.expanded = False
@@ -323,7 +326,7 @@ class AssistantPanel(QWidget):
     def providerPicker(self):
         # Compact provider combo; one sits on each page, kept in sync
         combo = smaller(QComboBox())
-        for pid, label in PROVIDERS:
+        for pid, label in self.providers:
             combo.addItem(label, pid)
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         combo.setToolTip('Which AI answers your questions')
@@ -350,9 +353,9 @@ class AssistantPanel(QWidget):
         row.addStretch()
         lay.addLayout(row)
         self.claudeBox = self.buildClaudeSignIn()
-        self.geminiBox = self.buildGeminiSignIn()
+        self.freeKeyBox = self.buildKeySignIn()
         lay.addWidget(self.claudeBox)
-        lay.addWidget(self.geminiBox)
+        lay.addWidget(self.freeKeyBox)
         self.signInStatus = QLabel(objectName='muted', wordWrap=True)
         self.signInStatus.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.signInStatus.hide()
@@ -388,28 +391,26 @@ class AssistantPanel(QWidget):
         lay.addWidget(self.keyBox)
         return box
 
-    def buildGeminiSignIn(self):
+    def buildKeySignIn(self):
+        # Generic "free key" view; its texts come from setKeyProvider
         box = QWidget()
         lay = QVBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
-        lay.addWidget(QLabel('<b>Free:</b> create a Gemini API key with your Google account — no payment card. '
-                             'Free-tier limits apply, and Google may use free-tier prompts to improve its products. '
-                             'Only small samples and query results are sent, never the whole file.',
-                             objectName='muted', wordWrap=True))
+        self.keySignupLabel = QLabel(objectName='muted', wordWrap=True)
+        lay.addWidget(self.keySignupLabel)
         lay.addSpacing(4)
-        getKey = QPushButton('Get a free key', objectName='primary')
-        getKey.setCursor(Qt.CursorShape.PointingHandCursor)
-        getKey.setToolTip(GEMINI_KEY_URL)
-        getKey.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GEMINI_KEY_URL)))
-        lay.addWidget(getKey)
+        self.getKeyButton = QPushButton('Get a free key', objectName='primary')
+        self.getKeyButton.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.getKeyButton.clicked.connect(self.openKeyUrl)
+        lay.addWidget(self.getKeyButton)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        self.geminiKeyEdit = QLineEdit(placeholderText='Paste your Gemini API key', echoMode=QLineEdit.EchoMode.Password)
-        self.geminiKeyEdit.returnPressed.connect(self.saveGeminiKey)
+        self.providerKeyEdit = QLineEdit(echoMode=QLineEdit.EchoMode.Password)
+        self.providerKeyEdit.returnPressed.connect(self.saveProviderKey)
         save = QPushButton('Save')
-        save.clicked.connect(self.saveGeminiKey)
-        row.addWidget(self.geminiKeyEdit, 1)
+        save.clicked.connect(self.saveProviderKey)
+        row.addWidget(self.providerKeyEdit, 1)
         row.addWidget(save)
         lay.addLayout(row)
         return box
@@ -574,11 +575,34 @@ class AssistantPanel(QWidget):
             self.keyEdit.clear()
             self.apiKeyEntered.emit(key)
 
-    def saveGeminiKey(self):
-        key = self.geminiKeyEdit.text().strip()
+    def saveProviderKey(self):
+        key = self.providerKeyEdit.text().strip()
         if key:
-            self.geminiKeyEdit.clear()
-            self.geminiKeyEntered.emit(key)
+            self.providerKeyEdit.clear()
+            self.providerKeyEntered.emit(self.provider, key)
+
+    def openKeyUrl(self):
+        if self.keyProvider.get('keyUrl'):
+            QDesktopServices.openUrl(QUrl(self.keyProvider['keyUrl']))
+
+    def setProviders(self, items):
+        # items: [(id, label)]; refills both pickers, keeping the selection
+        self.providers = list(items)
+        for combo in self.providerCombos:
+            combo.clear()
+            for pid, label in self.providers:
+                combo.addItem(label, pid)
+            combo.setCurrentIndex(max(0, combo.findData(self.provider)))
+
+    def setKeyProvider(self, info):
+        # info: {id, name, signupText, keyUrl, keyPlaceholder}; fills the free-key signed-out view
+        self.keyProvider = dict(info or {})
+        name = self.keyProvider.get('name', '')
+        self.updateSignInTitle()
+        self.keySignupLabel.setText((self.keyProvider.get('signupText') or '') + PRIVACY_NOTE)
+        self.getKeyButton.setToolTip(self.keyProvider.get('keyUrl', ''))
+        self.providerKeyEdit.setPlaceholderText(self.keyProvider.get('keyPlaceholder') or f'Paste your {name} API key')
+        self.providerKeyEdit.clear()
 
     def onProviderPicked(self, provider):
         if provider != self.provider:
@@ -590,10 +614,16 @@ class AssistantPanel(QWidget):
         self.provider = provider
         for combo in self.providerCombos:
             combo.setCurrentIndex(max(0, combo.findData(provider)))
-        gemini = provider == 'gemini'
-        self.signInTitle.setText('Gemini assistant' if gemini else 'Claude assistant')
-        self.claudeBox.setVisible(not gemini)
-        self.geminiBox.setVisible(gemini)
+        claude = provider == 'claude'
+        self.updateSignInTitle()
+        self.claudeBox.setVisible(claude)
+        self.freeKeyBox.setVisible(not claude)
+
+    def updateSignInTitle(self):
+        # The key provider's name once its info arrived, else the short name until it does
+        p = self.provider
+        name = self.keyProvider.get('name') if self.keyProvider.get('id') == p else SHORT_NAMES.get(p, p)
+        self.signInTitle.setText('Claude assistant' if p == 'claude' else f'{name} assistant')
 
     def setModelChoices(self, choices, current=''):
         # choices: [(modelId, label)]; empty shows `current` as a plain label (a fixed model)
@@ -753,8 +783,9 @@ class AssistantPanel(QWidget):
             if len(title) > TITLE_CHARS:
                 title = title[:TITLE_CHARS - 1].rstrip() + '…'
             text = title + (' — ' + item['when'] if item.get('when') else '')
-            if item.get('provider') == 'gemini':
-                text += ' · Gemini'
+            short = SHORT_NAMES.get(item.get('provider'))
+            if short:
+                text += ' · ' + short
             action = menu.addAction(text.replace('&', '&&'))
             action.setData(chatId)
             if chatId == self.currentChat:  # only the open chat carries a check, so the rest stay plain

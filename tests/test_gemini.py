@@ -1,4 +1,5 @@
-"""Drives the Gemini loop against a local fake OpenAI-compatible server (no network). Run: .venv/bin/python tests/test_gemini.py"""
+"""Drives the OpenAI-compatible chat loop (Gemini, Groq) against a local fake OpenAI-compatible server (no network). Run: .venv/bin/python tests/test_gemini.py"""
+import dataclasses
 import json
 import os
 import sys
@@ -10,11 +11,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from PyQt6.QtCore import QCoreApplication  # noqa: E402
 
-from csvviewer.assistant import gemini  # noqa: E402
+from csvviewer.assistant import gemini, providers  # noqa: E402
 from test_agent import FakeTools  # noqa: E402
 
 # Each entry: ('sse', [chunk dicts]) | ('sse-hang', [chunk dicts]) | ('error', status, body) | ('json', body)
 SCRIPT = []
+GEMINI = GROQ = None  # provider copies pointed at the fake server
 REQUESTS = []
 SENT = threading.Event()  # set once a hanging stream sent its chunks
 RELEASE = threading.Event()  # lets a hanging handler exit at the end
@@ -73,10 +75,10 @@ def delta(content=None, toolCalls=None, finish=None):
     return {'choices': [{'index': 0, 'delta': d, 'finish_reason': finish}]}
 
 
-def makeWorker(tools=None):
+def makeWorker(tools=None, provider=None, model='gemini-3.8-flash'):
     tools = tools or FakeTools()
     msgs = [{'role': 'system', 'content': 'sys'}, {'role': 'user', 'content': 'How many rows?'}]
-    worker = gemini.GeminiWorker(msgs, tools, 'gemini-3.8-flash', ' key123 ')
+    worker = gemini.ChatWorker(provider or GEMINI, msgs, tools, model, ' key123 ')
     ev = {'text': [], 'chips': [], 'done': [], 'errors': [], 'actions': [], 'finished': [], 'thinking': []}
     worker.textDelta.connect(ev['text'].append)
     worker.thinking.connect(ev['thinking'].append)
@@ -88,28 +90,34 @@ def makeWorker(tools=None):
     return worker, tools, ev
 
 
-def runSync(script):
+def runSync(script, provider=None, model='gemini-3.8-flash'):
     SCRIPT[:] = script
     REQUESTS.clear()
-    worker, tools, ev = makeWorker()
+    worker, tools, ev = makeWorker(provider=provider, model=model)
     worker.run()
     QCoreApplication.processEvents()
     return tools, ev
 
 
 def main():
+    global GEMINI, GROQ
     app = QCoreApplication([])  # noqa: F841
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    gemini.BASE_URL = f'http://127.0.0.1:{server.server_port}/v1beta/openai/'
+    GEMINI = dataclasses.replace(providers.GEMINI, baseUrl=f'http://127.0.0.1:{server.server_port}/v1beta/openai/')
+    GROQ = dataclasses.replace(providers.GROQ, baseUrl=f'http://127.0.0.1:{server.server_port}/openai/v1/')
 
     # 0. Tool conversion drops strict/additionalProperties and keeps the schema
-    conv = gemini.openaiTools([{'name': 'run_sql', 'description': 'd', 'strict': True, 'cache_control': {'type': 'ephemeral'},
-                                'input_schema': {'type': 'object', 'properties': {'query': {'type': 'string'}},
-                                                 'required': ['query'], 'additionalProperties': False}}])
+    defs = [{'name': 'run_sql', 'description': 'd', 'strict': True, 'cache_control': {'type': 'ephemeral'},
+             'input_schema': {'type': 'object', 'properties': {'query': {'type': 'string'}},
+                              'required': ['query'], 'additionalProperties': False}}]
+    conv = gemini.openaiTools(defs, GEMINI)
     assert conv == [{'type': 'function', 'function': {'name': 'run_sql', 'description': 'd', 'parameters': {
         'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}}], conv
+    # Groq keeps additionalProperties
+    conv = gemini.openaiTools(defs, GROQ)
+    assert conv[0]['function']['parameters'] == defs[0]['input_schema'] and 'strict' not in conv[0]['function'], conv
 
     # 1. Text + two tool calls (one split by index, one whole with a thought signature) + a bad-JSON call, then an answer
     sig = {'google': {'thought_signature': 'SIG=='}}
@@ -158,19 +166,19 @@ def main():
 
     # 2. 429 -> the free-limit message, not ok
     tools, ev = runSync([('error', 429, [{'error': {'code': 429, 'message': 'Resource exhausted', 'status': 'RESOURCE_EXHAUSTED'}}])])
-    assert ev['errors'] and 'free Gemini limit' in ev['errors'][0] and 'Flash-Lite' in ev['errors'][0], ev['errors']
+    assert ev['errors'] and 'free Google Gemini limit' in ev['errors'][0] and 'Flash-Lite' in ev['errors'][0], ev['errors']
     assert ev['finished'][0][0] is False and tools.closed
 
     # 3. Invalid key (400 with API_KEY_INVALID) -> the key message
     bad = [{'error': {'code': 400, 'message': 'API key not valid. Please pass a valid API key.', 'status': 'INVALID_ARGUMENT',
                       'details': [{'reason': 'API_KEY_INVALID'}]}}]
     _, ev = runSync([('error', 400, bad)])
-    assert ev['errors'] and ev['errors'][0].startswith('Google rejected the Gemini API key'), ev['errors']
+    assert ev['errors'] and ev['errors'][0].startswith('Google rejected the Google Gemini API key'), ev['errors']
     # 404 model and other errors carry Google's message
     _, ev = runSync([('error', 404, {'error': {'message': 'models/x is not found'}})])
-    assert ev['errors'][0] == 'This Gemini model is not available to your key: models/x is not found', ev['errors']
+    assert ev['errors'][0] == 'This Google Gemini model is not available to your key: models/x is not found', ev['errors']
     _, ev = runSync([('error', 500, {'error': {'message': 'Internal'}})])
-    assert ev['errors'][0] == 'Gemini API error 500: Internal', ev['errors']
+    assert ev['errors'][0] == 'Google Gemini API error 500: Internal', ev['errors']
 
     # 4. Cancel mid-stream stops promptly
     SCRIPT[:] = [('sse-hang', [delta('partial ')])]
@@ -195,15 +203,55 @@ def main():
 
     # 5. checkKey ok / bad / unreachable
     SCRIPT[:] = [('json', {'data': [{'id': 'models/gemini-3.8-flash'}]}), ('error', 400, bad)]
-    assert gemini.checkKey('good')[0] is True
+    assert gemini.checkKey(GEMINI, 'good')[0] is True
     assert REQUESTS[-1]['path'] == '/v1beta/openai/models' and REQUESTS[-1]['auth'] == 'Bearer good'
-    ok, message = gemini.checkKey('bad')
+    ok, message = gemini.checkKey(GEMINI, 'bad')
     assert not ok and 'rejected' in message, message
-    gemini.BASE_URL = 'http://127.0.0.1:1/'
-    ok, message = gemini.checkKey('x')
+    ok, message = gemini.checkKey(dataclasses.replace(GEMINI, baseUrl='http://127.0.0.1:1/'), 'x')
     assert not ok and message.startswith('Could not reach Google'), message
+
+    # 6. Groq: a full tool turn with gpt-oss (reasoning_effort sent)
+    turn1 = [delta('Counting. '),
+             delta(toolCalls=[{'index': 0, 'id': 'g1', 'type': 'function',
+                               'function': {'name': 'run_sql', 'arguments': '{"query": "SELECT 1"}'}}], finish='tool_calls')]
+    turn2 = [delta('There are 3 rows.', finish='stop')]
+    tools, ev = runSync([('sse', turn1), ('sse', turn2)], GROQ, 'openai/gpt-oss-120b')
+    assert not ev['errors'], ev['errors']
+    ok, msgs = ev['finished'][0]
+    assert ok and tools.closed and tools.ran == [('run_sql', {'query': 'SELECT 1'})], tools.ran
+    assert ''.join(ev['text']) == 'Counting. There are 3 rows.'
+    assert [m['role'] for m in msgs] == ['system', 'user', 'assistant', 'tool', 'assistant']
+    assert msgs[3] == {'role': 'tool', 'tool_call_id': 'g1', 'content': '{"rowCount": 3, "seconds": 1.25}'}, msgs[3]
+    assert msgs[4] == {'role': 'assistant', 'content': 'There are 3 rows.'}
+    first = REQUESTS[0]
+    assert first['path'] == '/openai/v1/chat/completions' and first['auth'] == 'Bearer key123'
+    body = first['body']
+    assert body['model'] == 'openai/gpt-oss-120b' and body['reasoning_effort'] == 'low' and body['stream'] is True
+    assert body['tool_choice'] == 'auto' and body['tools'][0]['function']['name'] == 'run_sql'
+    assert REQUESTS[1]['body']['messages'][3]['tool_call_id'] == 'g1'
+
+    # 7. Groq llama: no reasoning_effort
+    runSync([('sse', [delta('Hi', finish='stop')])], GROQ, 'llama-3.3-70b-versatile')
+    body = REQUESTS[0]['body']
+    assert body['model'] == 'llama-3.3-70b-versatile' and 'reasoning_effort' not in body, body
+
+    # 8. Groq errors: bad key, limit, malformed tool call
+    badGroq = {'error': {'message': 'Invalid API Key', 'type': 'invalid_request_error', 'code': 'invalid_api_key'}}
+    _, ev = runSync([('error', 401, badGroq)], GROQ, 'openai/gpt-oss-120b')
+    assert ev['errors'][0] == 'Groq rejected the Groq API key. Check it, or get a new one at https://console.groq.com/keys', ev['errors']
+    _, ev = runSync([('error', 429, {'error': {'message': 'Rate limit reached', 'type': 'tokens', 'code': 'rate_limit_exceeded'}})],
+                    GROQ, 'openai/gpt-oss-120b')
+    assert ev['errors'][0] == f'The free Groq limit is used up for now. {GROQ.limitHint}', ev['errors']
+    _, ev = runSync([('error', 400, {'error': {'message': 'Failed to call a function.', 'type': 'invalid_request_error',
+                                               'code': 'tool_use_failed', 'failed_generation': '<function=x>'}})],
+                    GROQ, 'llama-3.3-70b-versatile')
+    assert ev['errors'][0] == 'The model produced an invalid tool call. Ask again, or try another model.', ev['errors']
+    assert ev['finished'][0][0] is False
+    SCRIPT[:] = [('error', 401, badGroq)]
+    ok, message = gemini.checkKey(GROQ, 'gsk_bad')
+    assert not ok and message.startswith('Groq rejected') and 'console.groq.com/keys' in message, message
     server.shutdown()
-    print('all gemini tests passed')
+    print('all chat provider tests passed')
 
 
 if __name__ == '__main__':
