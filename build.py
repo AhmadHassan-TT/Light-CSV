@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Builds a standalone CSV Viewer with PyInstaller. Run on the target OS: python build.py"""
+"""Builds a standalone CSV Viewer with PyInstaller. Run on the target OS: python build.py [--onefile]
+
+Default: a folder app, zipped (fastest startup).
+--onefile: a single self-contained executable to hand out; it starts a few seconds slower
+because it unpacks itself to a temp folder on every launch.
+"""
 import os
 import platform
 import shutil
@@ -29,8 +34,11 @@ def main():
         print('PyInstaller is not installed. Install it with:\n    pip install pyinstaller')
         sys.exit(1)
 
+    oneFile = '--onefile' in sys.argv[1:]
     name = 'csv-viewer' if not (isWindows or isMac) else 'CSV Viewer'
     distDir = os.path.join(repo, 'dist')
+    # On Linux the single binary and the folder app share a name, so the binary is built in a subfolder
+    exeDir = os.path.join(distDir, 'onefile') if oneFile and not isWindows else distDir
     args = [
         os.path.join(repo, 'csvview.pyw'),
         '--name', name,
@@ -38,11 +46,13 @@ def main():
         '--noconfirm',
         '--clean',
         # onedir starts much faster than onefile, which unpacks all of Qt to a temp dir on every launch
-        '--onedir',
-        '--distpath', distDir,
+        '--onefile' if oneFile else '--onedir',
+        '--distpath', exeDir,
         '--workpath', os.path.join(repo, 'build'),
         '--specpath', os.path.join(repo, 'build'),
         '--add-data', f"{os.path.join(repo, 'assets')}{os.pathsep}assets",
+        # numpy.random imports secrets from compiled code, which PyInstaller cannot trace
+        '--hidden-import', 'secrets',
     ]
     if isWindows:
         args += ['--icon', os.path.join(repo, 'assets', 'csv-viewer.ico')]
@@ -55,8 +65,16 @@ def main():
 
     osName = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, sys.platform)
     arch = platform.machine().lower().replace('amd64', 'x86_64') or 'unknown'
-    zipBase = os.path.join(distDir, f'CSV-Viewer-{osName}-{arch}')
-    zipPath = shutil.make_archive(zipBase, 'zip', root_dir=distDir, base_dir=name)
+    archiveBase = os.path.join(distDir, f'CSV-Viewer-{osName}-{arch}')
+    if oneFile:
+        exe = os.path.join(exeDir, name + ('.exe' if isWindows else ''))
+        print(f'Built: {exe}')
+        if not isWindows:
+            # A tarball keeps the executable bit, which zips and CI artifact downloads lose
+            tarPath = shutil.make_archive(archiveBase, 'gztar', root_dir=exeDir, base_dir=name)
+            print(f'Packed: {tarPath}')
+        return
+    zipPath = shutil.make_archive(archiveBase, 'zip', root_dir=distDir, base_dir=name)
     print(f'Built: {os.path.join(distDir, name)}\nZipped: {zipPath}')
 
 

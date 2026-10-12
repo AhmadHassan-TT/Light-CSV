@@ -36,13 +36,23 @@ jobs:
       - name: Build
         run: python build.py
 
+      # Single self-contained file to hand out: CSV Viewer.exe on Windows, a tar.gz with csv-viewer on Linux
+      - name: Build single file
+        run: python build.py --onefile
+
       - uses: actions/upload-artifact@v4
         with:
           name: CSV-Viewer-${{ runner.os }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.exe
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.exe
