@@ -12,10 +12,15 @@ from . import agent
 TIMEOUT = 120
 
 
+USER_AGENT = 'Light-CSV/1.0 (+https://github.com/AhmadHassan-TT/Light-CSV)'
+
+
 def request(provider, path, key, body=None, timeout=TIMEOUT):
     """Open a GET (no body) or JSON POST to the provider; baseUrl is read at call time."""
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(provider.baseUrl + path, data=data, headers={'Authorization': f'Bearer {key}'})
+    # Cloudflare in front of some providers (Groq) blocks urllib's default User-Agent with a 403
+    req = urllib.request.Request(provider.baseUrl + path, data=data,
+                                 headers={'Authorization': f'Bearer {key}', 'User-Agent': USER_AGENT})
     if data is not None:
         req.add_header('Content-Type', 'application/json')
     return urllib.request.urlopen(req, timeout=timeout)
@@ -38,7 +43,9 @@ def errorInfo(e):
 
 
 def keyRejected(e, raw):
-    return e.code in (401, 403) or 'API_KEY_INVALID' in raw or 'invalid_api_key' in raw
+    # A plain-text 403 is a proxy block, not the provider judging the key
+    jsonBody = raw.lstrip()[:1] in ('{', '[')
+    return e.code == 401 or (e.code == 403 and jsonBody) or 'API_KEY_INVALID' in raw or 'invalid_api_key' in raw
 
 
 def unreachable(provider, e):

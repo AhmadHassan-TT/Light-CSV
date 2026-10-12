@@ -29,8 +29,16 @@ class Handler(BaseHTTPRequestHandler):
     def handle_one(self, method):
         length = int(self.headers.get('Content-Length') or 0)
         body = json.loads(self.rfile.read(length)) if length else None
-        REQUESTS.append({'method': method, 'path': self.path, 'auth': self.headers.get('Authorization'), 'body': body})
+        REQUESTS.append({'method': method, 'path': self.path, 'auth': self.headers.get('Authorization'), 'ua': self.headers.get('User-Agent'), 'body': body})
         kind, *rest = SCRIPT.pop(0)
+        if kind == 'text403':
+            data = b'error code: 1010\n'
+            self.send_response(403)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if kind == 'error':
             status, payload = rest
             data = json.dumps(payload).encode()
@@ -250,6 +258,12 @@ def main():
     SCRIPT[:] = [('error', 401, badGroq)]
     ok, message = gemini.checkKey(GROQ, 'gsk_bad')
     assert not ok and message.startswith('Groq rejected') and 'console.groq.com/keys' in message, message
+    # A proxy's plain-text 403 (Cloudflare 1010) is not reported as a rejected key, and requests carry our User-Agent
+    SCRIPT[:] = [('text403',)]
+    REQUESTS.clear()
+    ok, message = gemini.checkKey(GROQ, 'gsk_x')
+    assert not ok and 'rejected' not in message and '1010' in message, message
+    assert REQUESTS[0]['ua'].startswith('Light-CSV/'), REQUESTS[0]['ua']
     server.shutdown()
     print('all chat provider tests passed')
 
