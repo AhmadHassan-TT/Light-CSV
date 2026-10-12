@@ -5,7 +5,7 @@ import threading
 from bisect import bisect_left, bisect_right
 
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
     QFileDialog, QFormLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
@@ -23,6 +23,17 @@ MAX_COPY_CELLS = 200_000
 SEGMENT = 50_000_000
 DELIMITERS = {'Auto': None, 'Comma ,': ',', 'Semicolon ;': ';', 'Tab': '\t', 'Pipe |': '|'}
 ENCODINGS = ['Auto', 'utf-8', 'cp1252', 'latin-1']
+
+
+def assetPath(name):
+    # Assets sit next to the package in a checkout, or in the PyInstaller bundle dir
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, 'assets', name)
+
+
+def samePath(a, b):
+    # Windows paths are case-insensitive
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def humanSize(n):
@@ -681,7 +692,7 @@ class CsvTab(QWidget):
         base = os.path.splitext(self.index.path)[0]
         path, _ = QFileDialog.getSaveFileName(self, 'Export matching rows', f'{base}_matches.csv', 'CSV (*.csv)')
         if path:
-            if os.path.abspath(path) == os.path.abspath(self.index.path):
+            if samePath(path, self.index.path):
                 QMessageBox.warning(self, 'Export', 'Choose a different file than the one being viewed.')
                 return
             self.export = Export(self.index, s.hits, path).start()
@@ -869,7 +880,7 @@ class MainWindow(QMainWindow):
         path = os.path.abspath(path)
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
-            if tab.index and os.path.abspath(tab.index.path) == path:
+            if tab.index and samePath(tab.index.path, path):
                 self.tabs.setCurrentIndex(i)
                 return
         if os.path.isdir(path):
@@ -938,9 +949,14 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    if sys.platform == 'win32':
+        # Own taskbar group and icon instead of python.exe's
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('CSVViewer.App')
     app = QApplication(sys.argv)
     app.setApplicationName('CSV Viewer')
     app.setDesktopFileName('csv-viewer')
+    app.setWindowIcon(QIcon(assetPath('csv-viewer.ico' if sys.platform == 'win32' else 'csv-viewer.svg')))
     window = MainWindow()
     window.show()
     for path in sys.argv[1:]:

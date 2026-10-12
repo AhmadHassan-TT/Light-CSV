@@ -102,19 +102,28 @@ class Explorer(QWidget):
     # --- root ---
 
     def currentRoot(self):
-        return self.model.rootPath()
+        return os.path.normpath(self.model.rootPath()) if self.model.rootPath() else ''
 
     def setRoot(self, path):
+        if path == '' and os.name == 'nt':
+            # Windows drive list ("This PC")
+            self.view.setRootIndex(self.model.setRootPath(''))
+            self.pathEdit.setText('This PC')
+            self.upButton.setEnabled(False)
+            return
         path = os.path.abspath(os.path.expanduser(path))
         if not os.path.isdir(path):
             return
         self.view.setRootIndex(self.model.setRootPath(path))  # only this folder is watched
         self.pathEdit.setText(path)
-        self.upButton.setEnabled(os.path.dirname(path) != path)
+        self.upButton.setEnabled(os.path.dirname(path) != path or os.name == 'nt')
         self.settings.setValue(SETTINGS_KEY, path)
 
     def goUp(self):
-        self.setRoot(os.path.dirname(self.currentRoot()))
+        root = self.currentRoot()
+        parent = os.path.dirname(root)
+        # Above a drive root on Windows comes the drive list
+        self.setRoot('' if parent == root and os.name == 'nt' else parent)
 
     def chooseFolder(self):
         path = QFileDialog.getExistingDirectory(self, 'Choose folder', self.currentRoot())
@@ -123,7 +132,9 @@ class Explorer(QWidget):
 
     def onPathEntered(self):
         path = os.path.expanduser(self.pathEdit.text().strip())
-        if os.path.isdir(path):
+        if path == 'This PC' and os.name == 'nt':
+            self.setRoot('')
+        elif os.path.isdir(path):
             self.setRoot(path)
         else:
             self.pathEdit.setText(self.currentRoot())
@@ -146,7 +157,11 @@ class Explorer(QWidget):
         path = os.path.abspath(path)
         folder = os.path.dirname(path)
         root = self.currentRoot()
-        if os.path.commonpath([root, folder]) != root:
+        try:
+            inside = bool(root) and os.path.normcase(os.path.commonpath([root, folder])) == os.path.normcase(root)
+        except ValueError:
+            inside = False  # different drives on Windows
+        if not inside:
             self.setRoot(folder)
         self.pendingReveal = path
         self.tryReveal()

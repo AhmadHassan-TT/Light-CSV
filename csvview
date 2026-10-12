@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launcher: csvview [file.csv]"""
+"""Launcher: csvview [file.csv]  (csvview.pyw is the same launcher without a console window on Windows)"""
 import os
 import sys
 

@@ -1,4 +1,4 @@
-"""Sparse row index over a memory-mapped CSV so files of any size open instantly and scroll freely."""
+"""Sparse row index over a CSV so files of any size open instantly and scroll freely (Linux and Windows)."""
 import csv
 import mmap
 import os
@@ -34,19 +34,6 @@ def sniffEncoding(sample):
         return 'utf-8' if e.start >= len(sample) - 4 else 'cp1252'
 
 
-PAGE = mmap.PAGESIZE
-
-
-def releasePages(mm, start, end):
-    """Drop scanned pages from this process so memory stays flat; the OS page cache keeps them warm."""
-    start -= start % PAGE
-    if end > start and hasattr(mm, 'madvise'):
-        try:
-            mm.madvise(mmap.MADV_DONTNEED, start, end - start)
-        except (OSError, ValueError):
-            pass
-
-
 class CsvIndex:
     """Keeps the byte offset of every `block`-th row; any row is found by parsing at most one block."""
 
@@ -75,11 +62,21 @@ class CsvIndex:
     # ---------- indexing ----------
 
     def build(self):
-        mm, size, block = self.mm, self.size, self.block
+        # Whole-file scans read through their own handle instead of the map, so memory stays flat on every OS
+        with open(self.path, 'rb') as f:
+            self._build(f)
+
+    def _build(self, f):
+        size, block = self.size, self.block
         pos, carry, rowNo = self.start, 0, 0
+        chunk = np.empty(INDEX_CHUNK, dtype=np.uint8)
+        f.seek(pos)
         while pos < size and not self.cancelled:
-            end = min(pos + INDEX_CHUNK, size)
-            buf = np.frombuffer(mm, dtype=np.uint8, count=end - pos, offset=pos)
+            got = f.readinto(chunk)
+            if not got:
+                break
+            end = pos + got
+            buf = chunk[:got]
             nl = np.flatnonzero(buf == NL)
             if self.quoteAware:
                 quotes = np.flatnonzero(buf == QUOTE)
@@ -96,15 +93,14 @@ class CsvIndex:
                     rowNo += len(starts)
                     self.rowsIndexed = rowNo
                     self.indexedEnd = int(starts[-1])
-            releasePages(mm, pos, end)
             pos = end
             self.progress = (pos - self.start) / max(1, size - self.start)
         if not self.cancelled:
             with self.lock:
                 # Last row without a trailing newline
-                if self.indexedEnd < size:
+                if self.indexedEnd < pos:
                     self.rowsIndexed += 1
-                    self.indexedEnd = size
+                    self.indexedEnd = pos
                 self.progress = 1.0
                 self.done = True
 
@@ -248,14 +244,22 @@ class Search:
         # bytes.lower folds ASCII only, applied to both sides so they agree
         if not self.caseSensitive:
             pattern = pattern.lower()
-        mm, end = idx.mm, idx.indexedEnd
+        with open(idx.path, 'rb') as f:
+            self.scan(f, pattern)
+        self.progress = 1.0
+        self.done = True
+
+    def scan(self, f, pattern):
+        idx = self.index
+        end = idx.indexedEnd
         first = idx.dataStart()
         pos = first
         offsetRow = 1 if idx.hasHeader else 0
         span = max(1, end - first)
         while pos < end and not self.cancelled:
             chunkEnd = min(pos + SEARCH_CHUNK, end)
-            buf = mm[pos:min(chunkEnd + len(pattern) - 1, end)]
+            f.seek(pos)
+            buf = f.read(min(chunkEnd + len(pattern) - 1, end) - pos)
             if not self.caseSensitive:
                 buf = buf.lower()
             nextPos = chunkEnd
@@ -268,11 +272,8 @@ class Search:
                     nextPos = rowEnd
                     break
                 i = buf.find(pattern, rowEnd - pos)
-            releasePages(mm, pos, nextPos)
             pos = nextPos
             self.progress = min(1.0, (pos - first) / span)
-        self.progress = 1.0
-        self.done = True
 
     def matches(self, fileRow):
         if self.column is None:

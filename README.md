@@ -1,10 +1,12 @@
 # CSV Viewer
 
 A fast, read-only desktop viewer for very large CSV files (tested up to 11 GB / 160 million rows).
-Built with PyQt6 for Ubuntu / GNOME. Rows appear immediately and you can scroll while the file is
-still being indexed.
+Built with PyQt6 for Linux (Ubuntu / GNOME) and Windows. Rows appear immediately and you can
+scroll while the file is still being indexed.
 
 ## Install
+
+### Linux
 
 Requirements (system packages, no pip):
 
@@ -26,11 +28,37 @@ This is user-level only (no sudo) and safe to re-run. It adds:
 
 It does not change your default app for CSV files. Remove everything with `./uninstall.sh`.
 
+### Windows
+
+**Option A: standalone app (no Python needed).** Take the `CSV-Viewer-windows-*.zip` from the
+GitHub Actions build artifacts (or a release), or build it yourself on a Windows machine:
+
+```powershell
+pip install -r requirements.txt pyinstaller
+python build.py
+```
+
+Unzip `dist\CSV-Viewer-windows-*.zip` anywhere and run `CSV Viewer.exe`. The exe is unsigned, so
+Windows SmartScreen may warn on first launch: **More info → Run anyway**. PyInstaller cannot
+cross-compile; `build.py` builds for the OS it runs on.
+
+**Option B: from source.** Install Python 3.12 (`winget install Python.Python.3.12`, or from
+python.org), then from the repo folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-windows.ps1
+```
+
+This is user-level only (no admin) and safe to re-run. It installs PyQt6 and numpy with
+`pip --user`, adds a Start Menu shortcut **CSV Viewer**, adds CSV Viewer to **Open with** for
+`.csv .tsv .txt .psv .dat` (your default app is not changed), and writes `csvview.cmd` for
+terminal use. Remove it with `uninstall-windows.ps1`.
+
 ## Opening files
 
-- App menu: **CSV Viewer**
+- App menu / Start Menu: **CSV Viewer**
 - Files: right-click a CSV → **Open With** → **CSV Viewer**
-- Terminal: `csvview file.csv`
+- Terminal: `csvview file.csv` (Linux) or `csvview.cmd file.csv` (Windows, from source)
 - Drag and drop a file onto the window
 - **File ▸ Open** (Ctrl+O)
 - The **Explorer** side panel (F4): double-click a CSV
