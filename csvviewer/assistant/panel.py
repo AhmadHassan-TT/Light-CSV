@@ -3,10 +3,10 @@ import math
 import re
 
 from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QFontDatabase, QGuiApplication, QPalette, QTextCharFormat, QTextCursor, QTextFormat, QTextFrameFormat, QTextOption
+from PyQt6.QtGui import QColor, QDesktopServices, QFontDatabase, QGuiApplication, QIcon, QPalette, QTextCharFormat, QTextCursor, QTextFormat, QTextFrameFormat, QTextOption
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-    QStackedWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSizePolicy, QStackedWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
 )
 
 MODEL_LABEL = 'Haiku 5.5'
@@ -15,6 +15,9 @@ GEMINI_KEY_URL = 'https://aistudio.google.com/apikey'
 RENDER_MS = 50  # streamed text is re-rendered at most this often
 SUGGESTIONS = ['Summarize the current tab', 'What columns are there and what do they contain?',
                'Find anomalies or empty values']
+MAX_HISTORY = 30  # chats listed in the History menu
+TITLE_CHARS = 48  # history titles are elided past this
+MAX_COLUMN = 900  # messages stop widening past this in a wide window
 ROW_LINK = re.compile(r'^csvrow://([\d.]+)/(\d+)/?$', re.IGNORECASE)
 Role = QPalette.ColorRole
 
@@ -282,6 +285,10 @@ class AssistantPanel(QWidget):
     geminiKeyEntered = pyqtSignal(str)
     modelChosen = pyqtSignal(str)  # model id
     rowLinkClicked = pyqtSignal(int, int)  # tabId, row
+    chatOpened = pyqtSignal(str)  # chat id the user picked
+    chatDeleted = pyqtSignal(str)  # delete one chat
+    historyCleared = pyqtSignal()  # delete all
+    expandRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -294,6 +301,9 @@ class AssistantPanel(QWidget):
         self.dots = 0
         self.provider = 'claude'
         self.providerCombos = []
+        self.historyItems = []
+        self.currentChat = None
+        self.expanded = False
         self.renderTimer = QTimer(self, singleShot=True, interval=RENDER_MS, timeout=self.flush)
         self.thinkTimer = QTimer(self, interval=400, timeout=self.animateThinking)
         self.stack = QStackedWidget()
@@ -305,6 +315,8 @@ class AssistantPanel(QWidget):
         self.styleKey = None
         self.restyle()
         self.setProvider('claude')
+        self.setHistory([])
+        self.setExpanded(False)
 
     # ---------- building ----------
 
@@ -407,7 +419,7 @@ class AssistantPanel(QWidget):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(8, 6, 8, 8)
         lay.setSpacing(6)
-        # header: title + provider, New chat; model + auth label below
+        # header: title + provider, expand, New chat; model + auth label + History below
         head = QHBoxLayout()
         head.setSpacing(6)
         title = QLabel('Assistant')
@@ -417,9 +429,12 @@ class AssistantPanel(QWidget):
         newChat = QToolButton(text='New chat', autoRaise=True)
         newChat.setToolTip('Start a new conversation')
         newChat.clicked.connect(self.newChatRequested)
+        self.expandButton = smaller(QToolButton(autoRaise=True), 1.2)
+        self.expandButton.clicked.connect(self.expandRequested)
         head.addWidget(title)
         head.addWidget(self.providerPicker())
         head.addStretch()
+        head.addWidget(self.expandButton)
         head.addWidget(newChat)
         lay.addLayout(head)
         sub = QHBoxLayout()
@@ -432,16 +447,35 @@ class AssistantPanel(QWidget):
         self.modelCombo.hide()
         self.authLabel = smaller(QLabel(objectName='muted'))
         self.authLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.historyMenu = QMenu(self)
+        self.historyButton = smaller(QToolButton(text='History ▾', autoRaise=True, objectName='history'))
+        icon = QIcon.fromTheme('document-open-recent')
+        if icon.isNull():
+            self.historyButton.setText('◷ History ▾')
+        else:
+            self.historyButton.setIcon(icon)
+            self.historyButton.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.historyButton.setToolTip('Saved chats')
+        self.historyButton.setMenu(self.historyMenu)
+        self.historyButton.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         sub.addWidget(self.modelLabel)
         sub.addWidget(self.modelCombo)
         sub.addWidget(self.authLabel, 1)
+        sub.addWidget(self.historyButton)
         lay.addLayout(sub)
         # message list
         self.scroll = QScrollArea(widgetResizable=True, objectName='list')
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setBackgroundRole(Role.Base)
         self.listWidget = QWidget(objectName='listInner')
-        self.listLay = QVBoxLayout(self.listWidget)
+        outer = QHBoxLayout(self.listWidget)  # centers a capped column in a wide window
+        outer.setContentsMargins(0, 0, 0, 0)
+        column = QWidget()
+        column.setMaximumWidth(MAX_COLUMN)
+        outer.addStretch(1)
+        outer.addWidget(column, 1000)
+        outer.addStretch(1)
+        self.listLay = QVBoxLayout(column)
         self.listLay.setContentsMargins(6, 6, 6, 6)
         self.listLay.setSpacing(8)
         self.suggestions = QWidget()
@@ -503,6 +537,7 @@ class AssistantPanel(QWidget):
             QFrame#err {{ background: {c(mix(base, err, 0.12))}; border: 1px solid {c(mix(base, err, 0.55))}; border-radius: 8px; }}
             QFrame#chip {{ background: {c(mix(base, text, 0.09))}; border-radius: 6px; }}
             QToolButton#flat {{ border: none; background: transparent; color: {c(p.color(Role.Link))}; padding: 2px 0; }}
+            QToolButton#history::menu-indicator {{ image: none; width: 0; }}
             QFrame#chip QToolButton {{ border: none; background: transparent; padding: 2px 0; }}
             QTextBrowser#md {{ background: transparent; border: none; }}
             QLabel#muted {{ color: {c(mix(base, text, 0.6))}; }}
@@ -695,6 +730,61 @@ class AssistantPanel(QWidget):
     def setContextInfo(self, text):
         self.contextLabel.setText(text or '')
         self.contextLabel.setVisible(bool(text))
+
+    # ---------- history + window ----------
+
+    def setHistory(self, items):
+        # items: [{id, title, when, provider}] newest first; rebuilds the History menu
+        self.historyItems = list(items or [])
+        self.rebuildHistory()
+
+    def setCurrentChat(self, chatId):
+        self.currentChat = chatId or None
+        self.rebuildHistory()
+
+    def rebuildHistory(self):
+        menu = self.historyMenu
+        menu.clear()
+        if not self.historyItems:
+            menu.addAction('No saved chats yet').setEnabled(False)
+        for item in self.historyItems[:MAX_HISTORY]:
+            chatId = str(item.get('id', ''))
+            title = ' '.join(str(item.get('title') or 'Untitled chat').split())
+            if len(title) > TITLE_CHARS:
+                title = title[:TITLE_CHARS - 1].rstrip() + '…'
+            text = title + (' — ' + item['when'] if item.get('when') else '')
+            if item.get('provider') == 'gemini':
+                text += ' · Gemini'
+            action = menu.addAction(text.replace('&', '&&'))
+            action.setData(chatId)
+            if chatId == self.currentChat:  # only the open chat carries a check, so the rest stay plain
+                action.setCheckable(True)
+                action.setChecked(True)
+                font = action.font()
+                font.setBold(True)
+                action.setFont(font)
+            action.triggered.connect(lambda _=False, a=action, c=chatId: self.onChatPicked(a, c))
+        menu.addSeparator()
+        delete = menu.addAction('Delete current chat')
+        delete.setEnabled(bool(self.currentChat))
+        delete.triggered.connect(lambda: self.currentChat and self.chatDeleted.emit(self.currentChat))
+        clearAll = menu.addAction('Clear all history…')
+        clearAll.setEnabled(bool(self.historyItems))
+        clearAll.triggered.connect(self.confirmClearHistory)
+
+    def onChatPicked(self, action, chatId):
+        action.setChecked(action.isCheckable())  # the check moves only with setCurrentChat
+        self.chatOpened.emit(chatId)
+
+    def confirmClearHistory(self):
+        answer = QMessageBox.question(self, 'Clear history', 'Delete all saved chats? This cannot be undone.')
+        if answer == QMessageBox.StandardButton.Yes:
+            self.historyCleared.emit()
+
+    def setExpanded(self, on):
+        self.expanded = bool(on)
+        self.expandButton.setText('⤡' if on else '⤢')
+        self.expandButton.setToolTip('Put back in the side panel' if on else 'Open in a larger window')
 
     # ---------- input + links ----------
 

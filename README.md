@@ -152,6 +152,8 @@ Ask questions about the open tabs in plain language: **✦ Assistant** (top righ
 - **Google Gemini (free):** press **Get a free key** (aistudio.google.com, Google account, no payment card), paste the key, done. Free-tier limits apply (per minute and per day), and Google may use free-tier prompts to improve its products. Default model Gemini 3.8 Flash; Gemini 3.5 Flash-Lite is faster with higher free limits.
 - **Claude:** sign in with your own Claude API account: press **Sign in with Claude** (opens your browser; uses Anthropic's official `ant` CLI, downloaded automatically if missing), or paste an API key. Usage is billed to that account; the model is Claude Haiku 5.5 (low cost).
 - View ▸ Sign out of the assistant forgets the current provider's key or sign-in.
+- **History:** every chat is saved automatically. **◷ History** reopens one (you can keep asking in it), deletes the current chat, or clears all. Chats are stored on this PC only.
+- **⤢** opens the assistant in a larger window for long reports; **⤡** puts it back. You can also drag the panel's edge to make it wider.
 - **What leaves your PC:** only small samples and query results - never the file. Claude works through local tools: list tabs, sample rows, read rows, search, **SQL over the whole file (DuckDB; tab N is view `tN`)**, and jump to rows. Each step shows as a chip you can expand.
 - Answers link rows like *row 7*: click to jump there. **Stop** cancels a running query; **New chat** starts fresh.
 - Requires the `anthropic` and `duckdb` packages: `./install.sh` puts them in `.venv` (Linux), `install-windows.ps1` installs them, and the standalone builds include them. Without them the viewer works and the panel says what is missing.

@@ -6,7 +6,7 @@ from PyQt6.QtCore import QObject, QProcess, Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import QDockWidget, QMessageBox
 
-from . import auth
+from . import auth, history
 from .context import snapshotTabs
 
 MODEL = 'claude-haiku-5-5'
@@ -201,6 +201,7 @@ class Assistant(QObject):
         self.tabWidgets = {}
         self.login = None
         self.provider = auth.settings().value('assistant/provider', 'claude')
+        self.chat = None  # the saved chat being shown (history.newChat dict)
         self.panel = AssistantPanel()
         self.dock = QDockWidget('Assistant', window)
         self.dock.setObjectName('assistant')
@@ -221,6 +222,12 @@ class Assistant(QObject):
         self.panel.geminiKeyEntered.connect(self.useGeminiKey)
         self.panel.modelChosen.connect(self.chooseModel)
         self.keyChecked.connect(self.onKeyChecked)
+        self.panel.chatOpened.connect(self.openChat)
+        self.panel.chatDeleted.connect(self.deleteChat)
+        self.panel.historyCleared.connect(self.clearHistory)
+        self.panel.expandRequested.connect(self.toggleExpanded)
+        self.dock.topLevelChanged.connect(self.panel.setExpanded)
+        self.refreshHistory()
         self.panel.setProvider(self.provider)
         window.tabs.currentChanged.connect(self.updateContext)
         self.dock.visibilityChanged.connect(lambda shown: shown and (self.refreshAuth(), self.updateContext()))
@@ -338,10 +345,16 @@ class Assistant(QObject):
         self.panel.setBusy(True)
         # The worker gets its own copy; the conversation only advances when a question completes
         content = f'{contextBlock(tabs)}\n\n{question}'
+        if self.chat is None:
+            from . import gemini
+            model = 'Haiku 5.5' if self.provider == 'claude' else gemini.savedModel()
+            self.chat = history.newChat(self.provider, model, question)
+        self.record('user', question)
+        self.record('start')
         if self.provider == 'gemini':
             from . import gemini
-            history = self.messages or [{'role': 'system', 'content': SYSTEM}]
-            self.worker = gemini.GeminiWorker(history + [{'role': 'user', 'content': content}], CsvTools(tabs),
+            earlier = self.messages or [{'role': 'system', 'content': SYSTEM}]
+            self.worker = gemini.GeminiWorker(earlier + [{'role': 'user', 'content': content}], CsvTools(tabs),
                                               gemini.savedModel(), gemini.savedKey())
         else:
             self.worker = Worker(self.messages + [{'role': 'user', 'content': content}], CsvTools(tabs))
@@ -351,6 +364,10 @@ class Assistant(QObject):
         self.worker.toolFinished.connect(self.panel.finishToolChip)
         self.worker.uiAction.connect(self.applyAction)
         self.worker.failed.connect(self.panel.showError)
+        self.worker.textDelta.connect(lambda t: self.record('text', t))
+        self.worker.toolStarted.connect(lambda *a: self.record('chip', *a))
+        self.worker.toolFinished.connect(lambda *a: self.record('chipDone', *a))
+        self.worker.failed.connect(lambda t: self.record('error', t))
         self.worker.finished.connect(self.onFinished)
         self.worker.start()
 
@@ -367,6 +384,14 @@ class Assistant(QObject):
                     pass
         self.panel.endAssistantMessage()
         self.panel.setBusy(False)
+        if self.chat is not None:
+            self.record('end')
+            self.chat['messages'] = self.messages
+            try:
+                history.save(self.chat)
+            except OSError as e:
+                self.panel.showError(f'Could not save this chat: {e}')
+            self.refreshHistory()
 
     def stop(self):
         if self.worker:
@@ -375,8 +400,75 @@ class Assistant(QObject):
     def newChat(self):
         self.stop()
         self.messages = []
+        self.chat = None
         self.panel.clear()
+        self.panel.setCurrentChat('')
         self.updateContext()
+
+    # ---------- history ----------
+
+    def record(self, kind, *args):
+        """Keep what the panel showed, so a saved chat can be replayed."""
+        if self.chat is None:
+            return
+        display = self.chat['display']
+        if kind == 'text' and display and display[-1][0] == 'text':
+            display[-1][1] += args[0]  # one entry per streamed answer, not per token
+        else:
+            display.append([kind, *args])
+
+    def refreshHistory(self):
+        items = [{'id': c['id'], 'title': c['title'], 'when': history.whenText(c['updated']), 'provider': c['provider']}
+                 for c in history.listChats()]
+        self.panel.setHistory(items)
+        self.panel.setCurrentChat(self.chat['id'] if self.chat else '')
+
+    def openChat(self, chatId):
+        try:
+            chat = history.load(chatId)
+        except (OSError, ValueError) as e:
+            self.panel.showError(f'Could not open that chat: {e}')
+            return
+        self.stop()
+        if chat.get('provider', 'claude') != self.provider:
+            self.provider = chat.get('provider', 'claude')
+            auth.settings().setValue('assistant/provider', self.provider)
+            self.panel.setProvider(self.provider)
+            self.refreshAuth()
+        self.chat = chat
+        self.messages = chat.get('messages', [])
+        self.panel.clear()
+        replay = {'user': self.panel.addUserMessage, 'start': self.panel.startAssistantMessage, 'text': self.panel.appendText,
+                  'chip': self.panel.addToolChip, 'chipDone': self.panel.finishToolChip, 'error': self.panel.showError,
+                  'end': self.panel.endAssistantMessage}
+        for kind, *args in chat.get('display', []):
+            if kind in replay:
+                replay[kind](*args)
+        self.panel.setCurrentChat(chatId)
+        self.updateContext()
+
+    def deleteChat(self, chatId):
+        history.delete(chatId)
+        if self.chat and self.chat['id'] == chatId:
+            self.newChat()
+        self.refreshHistory()
+
+    def clearHistory(self):
+        history.clear()
+        self.newChat()
+        self.refreshHistory()
+
+    # ---------- larger window ----------
+
+    def toggleExpanded(self):
+        if self.dock.isFloating():
+            self.dock.setFloating(False)
+            return
+        self.dock.setFloating(True)
+        # A roomy window over the main one, for reading long reports
+        area = self.window.screen().availableGeometry() if self.window.screen() else self.window.geometry()
+        width, height = min(1100, int(area.width() * 0.7)), int(area.height() * 0.85)
+        self.dock.setGeometry(area.x() + (area.width() - width) // 2, area.y() + (area.height() - height) // 2, width, height)
 
     # ---------- viewer actions ----------
 

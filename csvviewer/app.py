@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
     QFileDialog, QFormLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QToolButton,
-    QHBoxLayout, QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTableView, QVBoxLayout, QWidget,
+    QHBoxLayout, QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTableView, QVBoxLayout, QWidget,
 )
 
 from .explorer import Explorer
@@ -363,6 +363,8 @@ class CsvTab(QWidget):
         self.detailBox = detailBox
         self.infoLabel = QLabel('')
         self.infoLabel.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # A long path must not stop the window from giving width to the side panels; it clips instead
+        self.infoLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.cellLabel = QLabel('')
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
@@ -396,14 +398,15 @@ class CsvTab(QWidget):
         bar.setContentsMargins(6, 4, 6, 0)
         self.searchBox = QLineEdit(placeholderText='Search the whole file…  (Enter = find / next, Shift+Enter = previous)')
         self.searchBox.setClearButtonEnabled(True)
-        self.searchBox.setMinimumWidth(300)
+        self.searchBox.setMinimumWidth(140)  # small minimums let the side panels take more of the window
         self.searchBox.returnPressed.connect(self.onSearchEnter)
         prev = QShortcut(QKeySequence('Shift+Return'), self.searchBox)
         prev.setContext(Qt.ShortcutContext.WidgetShortcut)
         prev.activated.connect(self.prevMatch)
         bar.addWidget(self.searchBox, 1)
         self.columnBox = QComboBox()
-        self.columnBox.setMinimumWidth(150)
+        self.columnBox.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.columnBox.setMinimumContentsLength(10)
         self.columnBox.setMaxVisibleItems(25)
         self.columnBox.setToolTip('Search in one column only')
         bar.addWidget(self.columnBox)
@@ -416,9 +419,12 @@ class CsvTab(QWidget):
             btn.clicked.connect(slot)
             if len(text) == 1:
                 btn.setFixedWidth(34)
+            else:
+                btn.setMinimumWidth(56)
             bar.addWidget(btn)
         self.stopBtn = QPushButton('Stop')
         self.stopBtn.clicked.connect(self.stopSearch)
+        self.stopBtn.setMinimumWidth(56)
         self.stopBtn.setEnabled(False)
         bar.addWidget(self.stopBtn)
         self.onlyMatches = QCheckBox('Only matches')
@@ -427,9 +433,10 @@ class CsvTab(QWidget):
         bar.addWidget(self.onlyMatches)
         clearBtn = QPushButton('Clear')
         clearBtn.clicked.connect(self.clearSearch)
+        clearBtn.setMinimumWidth(56)
         bar.addWidget(clearBtn)
         self.matchLabel = QLabel('')
-        self.matchLabel.setMinimumWidth(190)
+        self.matchLabel.setMinimumWidth(0)
         bar.addWidget(self.matchLabel)
         bar.addWidget(QLabel('Freeze'))
         self.freezeSpin = QSpinBox()
@@ -538,8 +545,8 @@ class CsvTab(QWidget):
         if s:
             if s.done:
                 self.stopBtn.setEnabled(False)
-            scanning = '' if s.done else f'  (scanning {s.progress:.0%})'
-            self.matchLabel.setText(f'{len(s.hits):,} matching rows{scanning}')
+            scanning = '' if s.done else f' · {s.progress:.0%}'
+            self.matchLabel.setText(f'{len(s.hits):,} matches{scanning}')
         e = self.export
         if e:
             if e.done:
