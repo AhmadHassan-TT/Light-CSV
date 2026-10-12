@@ -152,20 +152,24 @@ class GeminiWorker(QObject):
 
     def cancel(self):
         self.cancelled = True
+        self.tools.cancel()
+        # End the question first: on Windows closing the connection waits on the blocked read's lock
+        self.finish(False)
         resp = self.response
         if resp is not None:
-            # Shut the socket down so a blocked read returns at once, then close
-            try:
-                resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                resp.close()
-            except Exception:
-                pass
-        self.tools.cancel()
-        # On Windows the blocked read may only return at its timeout, so the question ends now
-        self.finish(False)
+            threading.Thread(target=self.closeResponse, args=(resp,), daemon=True).start()
+
+    @staticmethod
+    def closeResponse(resp):
+        # Shut the socket down so a blocked read returns, then close
+        try:
+            resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            resp.close()
+        except Exception:
+            pass
 
     def run(self):
         ok = False
