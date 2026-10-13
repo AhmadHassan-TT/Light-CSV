@@ -15,7 +15,7 @@ import urllib.request
 
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from csvviewer.mcpserver import config  # noqa: E402
+from csvviewer.mcpserver import config, server  # noqa: E402
 
 TIMEOUT = 600  # tool calls (searches, SQL) can take minutes
 LAUNCH_WAIT = 20
@@ -140,12 +140,50 @@ def errorReply(message, text):
     return errors if isinstance(message, list) else errors[0]
 
 
+def answerLocally(message):
+    """Reply to handshake/listing messages without the app, so connecting never opens a window.
+    Returns (handled, reply); the app is started only when a tool is actually called."""
+    if not isinstance(message, dict):
+        return False, None
+    method, msgId = message.get('method', ''), message.get('id')
+    if method.startswith('notifications/'):
+        return True, None
+    if method == 'initialize':
+        params = message.get('params') or {}
+        requested = params.get('protocolVersion')
+        return True, {'jsonrpc': '2.0', 'id': msgId, 'result': {
+            'protocolVersion': requested if requested in server.SUPPORTED_VERSIONS else server.LATEST_VERSION,
+            'capabilities': {'tools': {'listChanged': False}}, 'serverInfo': server.SERVER_INFO,
+            'instructions': server.INSTRUCTIONS}}
+    if method == 'ping':
+        return True, {'jsonrpc': '2.0', 'id': msgId, 'result': {}}
+    if method == 'tools/list':
+        tools = config.loadToolsCache()
+        if tools:
+            return True, {'jsonrpc': '2.0', 'id': msgId, 'result': {'tools': tools}}
+    return False, None
+
+
+def appRunning():
+    try:
+        post(json.dumps({'jsonrpc': '2.0', 'id': 'bridge-ping', 'method': 'ping'}).encode(), timeout=2)
+        return True
+    except NotRunning:
+        return False
+
+
 def relay(line):
     try:
         message = json.loads(line)
     except ValueError:
         write({'jsonrpc': '2.0', 'id': None, 'error': {'code': -32700, 'message': 'Parse error: invalid JSON'}})
         return
+    if not appRunning():
+        handled, reply = answerLocally(message)
+        if handled:
+            if reply is not None:
+                write(reply)
+            return
     body = json.dumps(message).encode()
     try:
         try:

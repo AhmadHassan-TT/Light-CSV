@@ -194,10 +194,25 @@ def testBridge(server):
     deadPort = freePort()
     config.writeState(f'http://127.0.0.1:{deadPort}/mcp', deadPort, os.getpid())
     t0 = time.monotonic()
-    out, err = runBridge([rpc('ping', 1), {'jsonrpc': '2.0', 'method': 'notifications/initialized'}],
+    # Connecting never needs the app: initialize and ping are answered by the bridge, tools/list from the app's cache
+    config.saveToolsCache([{'name': 'echo', 'description': 'cached', 'inputSchema': {'type': 'object'}}])
+    out, err = runBridge([rpc('initialize', 1, {'protocolVersion': '2025-06-18', 'capabilities': {},
+                                                'clientInfo': {'name': 't', 'version': '0'}}),
+                          {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+                          rpc('ping', 2), rpc('tools/list', 3)],
                          env={'CSV_VIEWER_MCP_NO_LAUNCH': '1'})
-    assert len(out) == 1 and out[0]['id'] == 1 and out[0]['error']['code'] == -32000, out
-    assert 'not running' in out[0]['error']['message'] and time.monotonic() - t0 < 10
+    byId = {m['id']: m for m in out}
+    assert sorted(byId) == [1, 2, 3], (out, err)
+    assert byId[1]['result']['serverInfo']['name'] == 'light-csv' and byId[1]['result']['protocolVersion'] == '2025-06-18'
+    assert byId[2]['result'] == {} and byId[3]['result']['tools'][0]['description'] == 'cached'
+    # A tool call does need the app; with auto-launch off it reports that the app is not running
+    out, err = runBridge([rpc('tools/call', 4, {'name': 'echo', 'arguments': {}})], env={'CSV_VIEWER_MCP_NO_LAUNCH': '1'})
+    assert len(out) == 1 and out[0]['id'] == 4 and out[0]['error']['code'] == -32000, out
+    assert 'not running' in out[0]['error']['message'] and time.monotonic() - t0 < 15
+    # Without a cache, tools/list falls back to the app (here: not running)
+    os.remove(config.toolsCachePath())
+    out, err = runBridge([rpc('tools/list', 5)], env={'CSV_VIEWER_MCP_NO_LAUNCH': '1'})
+    assert out[0]['error']['code'] == -32000, out
     config.clearState()
     assert set(config.readState()) == {'token'}
     if os.name != 'nt':

@@ -64,6 +64,10 @@ class McpControl(QObject):
             return
         self.server = server
         config.writeState(server.url, server.port, os.getpid())
+        try:
+            config.saveToolsCache(self.tools.definitions())  # lets the bridge list tools without starting the app
+        except OSError:
+            pass
         self.window.statusBar().showMessage(f'MCP server on at {server.url}', 6000)
 
     def stop(self):

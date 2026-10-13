@@ -81,6 +81,6 @@ Tabs are numbered by position (`tabId` 1, 2, …). Rows are 1-based data rows, a
 
 ## Details
 
-- **Transport:** MCP Streamable HTTP at `/mcp` (JSON responses, protocol versions 2024-11-05 to 2025-11-25). The bridge (`csvview_mcp.py`, built as `csvview-mcp`) converts stdio to that HTTP endpoint and launches the app with `--mcp` when it is not running.
+- **Transport:** MCP Streamable HTTP at `/mcp` (JSON responses, protocol versions 2024-11-05 to 2025-11-25). The bridge (`csvview_mcp.py`, built as `csvview-mcp`) converts stdio to that HTTP endpoint. Connecting never opens a window: the bridge answers the handshake itself and lists tools from a copy the app saves; it starts the app (with `--mcp`) only when a tool is actually called.
 - **Token and state:** `mcp.json` in `~/.config/csv-viewer/` (Linux), `%APPDATA%\csv-viewer\` (Windows) or `~/Library/Application Support/csv-viewer/` (macOS); file mode 600 on Linux/macOS. Delete the file to issue a new token (reconnect your apps afterwards).
 - Long operations (indexing an 11 GB file, a full-file search or SQL scan) run off the UI thread, so the window stays responsive while an app works with it.

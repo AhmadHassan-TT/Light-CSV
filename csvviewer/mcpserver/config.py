@@ -86,3 +86,24 @@ def clearState():
         for k in ('url', 'port', 'pid', 'updated'):
             data.pop(k, None)
         save(data)
+
+
+def toolsCachePath():
+    return os.path.join(configDir(), 'mcp-tools.json')
+
+
+def saveToolsCache(tools):
+    """The app's tool list, so the bridge can answer tools/list without starting the app."""
+    tmp = toolsCachePath() + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(tools, f)
+    os.replace(tmp, toolsCachePath())
+
+
+def loadToolsCache():
+    try:
+        with open(toolsCachePath(), encoding='utf-8') as f:
+            tools = json.load(f)
+        return tools if isinstance(tools, list) and tools else None
+    except (OSError, ValueError):
+        return None
