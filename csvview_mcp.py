@@ -73,6 +73,13 @@ def appCommand():
     """Command that starts the viewer with its MCP server, or None if no launcher is found."""
     if getattr(sys, 'frozen', False):
         folder = os.path.dirname(sys.executable)
+        if sys.platform == 'darwin':
+            # macOS ships an app bundle next to the bridge (or installed in /Applications); open starts it properly
+            for bundle in (os.path.join(folder, 'CSV Viewer.app'), '/Applications/CSV Viewer.app',
+                           os.path.expanduser('~/Applications/CSV Viewer.app')):
+                if os.path.isdir(bundle):
+                    return ['open', '-a', bundle, '--args', '--mcp']
+            return None
         for name in APP_NAMES:
             path = os.path.join(folder, name)
             if os.path.isfile(path) and os.path.realpath(path) != os.path.realpath(sys.executable):

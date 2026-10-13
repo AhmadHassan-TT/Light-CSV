@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04]
+        os: [windows-latest, ubuntu-22.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +30,11 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt pyinstaller
 
+      # PyInstaller needs Pillow to turn the .ico into the Mac .icns
+      - name: Install Pillow (macOS icon)
+        if: runner.os == 'macOS'
+        run: python -m pip install pillow
+
       - name: Test
         run: |
           python tests/test_index.py
@@ -45,8 +50,34 @@ jobs:
       - name: Build
         run: python build.py
 
+      # Real-Mac checks of the built bundle: signature intact (else "app is damaged"), it starts, the bridge answers
+      - name: Check macOS app
+        if: runner.os == 'macOS'
+        run: |
+          APP="$(ls -d dist/CSV-Viewer-macos-*/'CSV Viewer.app')"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          file "$APP/Contents/MacOS/CSV Viewer"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist"
+          python - "$APP" <<'PY'
+          import json, os, subprocess, sys, time
+          app = sys.argv[1]
+          env = dict(os.environ, QT_QPA_PLATFORM='offscreen', CSV_VIEWER_CONFIG_DIR=os.path.abspath('smoke-cfg'))
+          proc = subprocess.Popen([os.path.join(app, 'Contents', 'MacOS', 'CSV Viewer')], env=env)
+          time.sleep(10)
+          assert proc.poll() is None, f'app exited early with code {proc.returncode}'
+          proc.terminate(); proc.wait(10)
+          bridge = os.path.join(os.path.dirname(app), 'csvview-mcp')
+          msg = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'ci', 'version': '1'}}})
+          out = subprocess.run([bridge], input=msg + '\n', capture_output=True, text=True, timeout=60, env=dict(env, CSV_VIEWER_MCP_NO_LAUNCH='1')).stdout
+          reply = json.loads(out.splitlines()[0])
+          assert reply['result']['serverInfo']['name'] == 'light-csv', reply
+          print('app started and stayed up; bridge answered:', reply['result']['serverInfo'])
+          PY
+          ditto -x -k dist/CSV-Viewer-macos-*.zip unzipped && codesign --verify --deep --strict "unzipped/$(basename "$(dirname "$APP")")/CSV Viewer.app" && echo "zip round-trip keeps the signature"
+
       # Single self-contained file to hand out: CSV Viewer.exe on Windows, a tar.gz with csv-viewer on Linux
       - name: Build single file
+        if: runner.os != 'macOS'
         run: python build.py --onefile
 
       - uses: actions/upload-artifact@v4

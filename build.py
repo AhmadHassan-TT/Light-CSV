@@ -39,6 +39,20 @@ def buildBridge(targetDir):
     subprocess.run(args, check=True)
 
 
+def packMac(distDir, name):
+    """Zip CSV Viewer.app with the MCP bridge beside it (not inside: changing a built bundle breaks its signature)."""
+    arch = platform.machine().lower()
+    stage = os.path.join(distDir, f'CSV-Viewer-macos-{arch}')
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    shutil.move(os.path.join(distDir, f'{name}.app'), os.path.join(stage, f'{name}.app'))
+    buildBridge(stage)
+    # ditto keeps the bundle's symlinks and signatures, which a plain zip would break ("app is damaged")
+    zipPath = stage + '.zip'
+    subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', stage, zipPath], check=True)
+    print(f'Built: {stage}\nZipped: {zipPath}')
+
+
 def main():
     try:
         import PyInstaller.__main__
@@ -47,6 +61,10 @@ def main():
         sys.exit(1)
 
     oneFile = '--onefile' in sys.argv[1:]
+    if oneFile and isMac:
+        # A Mac app is always a .app bundle; the zipped bundle from the normal build is the thing to hand out
+        print('--onefile is not used on macOS; run python build.py for the .app')
+        return
     name = 'csv-viewer' if not (isWindows or isMac) else 'CSV Viewer'
     distDir = os.path.join(repo, 'dist')
     # On Linux the single binary and the folder app share a name, so the binary is built in a subfolder
@@ -68,12 +86,18 @@ def main():
     ]
     if isWindows:
         args += ['--icon', os.path.join(repo, 'assets', 'csv-viewer.ico')]
+    if isMac:
+        # PyInstaller turns the .ico into .icns (needs Pillow)
+        args += ['--icon', os.path.join(repo, 'assets', 'csv-viewer.ico'), '--osx-bundle-identifier', 'io.github.ahmadhassan-tt.lightcsv']
     for module in qtExcludes:
         args += ['--exclude-module', f'PyQt6.{module}']
     for module in otherExcludes:
         args += ['--exclude-module', module]
 
     PyInstaller.__main__.run(args)
+    if isMac:
+        packMac(distDir, name)
+        return
     # The MCP bridge sits beside the app so it can find and launch it
     buildBridge(exeDir if oneFile else os.path.join(distDir, name))
 

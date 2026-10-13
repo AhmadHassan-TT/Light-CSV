@@ -70,6 +70,16 @@ This is user-level only (no admin) and safe to re-run. It installs PyQt6 and num
 `.csv .tsv .txt .psv .dat` (your default app is not changed), and writes `csvview.cmd` for
 terminal use. Remove it with `uninstall-windows.ps1`.
 
+### macOS (Apple Silicon: M1 and newer)
+
+1. Download `CSV-Viewer-macos-arm64.zip` from the [latest release](https://github.com/AhmadHassan-TT/Light-CSV/releases/latest) and double-click it to unzip.
+2. Drag **CSV Viewer.app** into **Applications** (keep `csvview-mcp` somewhere handy if you want to connect Claude Desktop - it finds the app in Applications).
+3. First start: the app is not notarized by Apple, so macOS blocks it once. Open it, then go to **System Settings ▸ Privacy & Security** and click **Open Anyway** (on older macOS: right-click the app ▸ **Open**). Or in Terminal:
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/CSV Viewer.app"
+   ```
+On a Mac, shortcuts shown here with **Ctrl** use **⌘ Cmd**.
+
 ## Opening files
 
 - App menu / Start Menu: **CSV Viewer**
