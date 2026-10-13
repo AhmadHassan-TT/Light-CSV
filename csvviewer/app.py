@@ -858,6 +858,8 @@ class MainWindow(QMainWindow):
         cornerLayout.addWidget(askButton)
         cornerLayout.addWidget(self.tabs.cornerWidget(Qt.Corner.TopRightCorner))
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+        from .mcpserver.control import McpControl
+        self.mcp = McpControl(self, forceOn='--mcp' in sys.argv)
         self.buildMenus()
         self.setTheme(self.settings.value('view/theme', 'system'))
         geometry = self.settings.value('window/geometry')
@@ -921,6 +923,8 @@ class MainWindow(QMainWindow):
         view.addSeparator()
         self.act(view, 'Ne&xt tab', lambda: self.cycleTab(1), [QKeySequence('Ctrl+Tab'), QKeySequence('Ctrl+PgDown')])
         self.act(view, 'Pre&vious tab', lambda: self.cycleTab(-1), [QKeySequence('Ctrl+Shift+Tab'), QKeySequence('Ctrl+PgUp')])
+        tools = self.menuBar().addMenu('&Tools')
+        self.mcp.menuActions(tools)
 
     def setTheme(self, theme):
         if theme not in THEMES:
@@ -1025,6 +1029,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.assistant.shutdown()
+        self.mcp.stop()
         self.settings.setValue('window/geometry', self.saveGeometry())
         self.settings.setValue('window/state', self.saveState())
         while self.tabs.count():
@@ -1044,7 +1049,8 @@ def main():
     window = MainWindow()
     window.show()
     for path in sys.argv[1:]:
-        window.openPath(path)
+        if not path.startswith('--'):  # --mcp: started by the MCP bridge
+            window.openPath(path)
     sys.exit(app.exec())
 
 

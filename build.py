@@ -8,6 +8,7 @@ because it unpacks itself to a temp folder on every launch.
 import os
 import platform
 import shutil
+import subprocess
 import sys
 
 repo = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +26,17 @@ qtExcludes = [
 ]
 # QtSvg is kept: the svg icon is loaded through QIcon
 otherExcludes = ['tkinter', 'unittest', 'pydoc']
+
+
+def buildBridge(targetDir):
+    """csvview-mcp: the small console MCP stdio bridge (stdlib only), placed next to the app."""
+    args = [sys.executable, '-m', 'PyInstaller', os.path.join(repo, 'csvview_mcp.py'), '--name', 'csvview-mcp',
+            '--onefile', '--console', '--noconfirm', '--distpath', targetDir,
+            '--workpath', os.path.join(repo, 'build', 'bridge'), '--specpath', os.path.join(repo, 'build', 'bridge')]
+    # The bridge never touches Qt or the data stack, so keep them out
+    for module in ('PyQt6', 'numpy', 'duckdb', 'anthropic', 'tkinter', 'unittest', 'pydoc'):
+        args += ['--exclude-module', module]
+    subprocess.run(args, check=True)
 
 
 def main():
@@ -62,6 +74,8 @@ def main():
         args += ['--exclude-module', module]
 
     PyInstaller.__main__.run(args)
+    # The MCP bridge sits beside the app so it can find and launch it
+    buildBridge(exeDir if oneFile else os.path.join(distDir, name))
 
     osName = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, sys.platform)
     arch = platform.machine().lower().replace('amd64', 'x86_64') or 'unknown'

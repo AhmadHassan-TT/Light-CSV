@@ -159,6 +159,14 @@ Ask questions about the open tabs in plain language: **✦ Assistant** (top righ
 - Answers link rows like *row 7*: click to jump there. **Stop** cancels a running query; **New chat** starts fresh.
 - Requires the `anthropic` and `duckdb` packages: `./install.sh` puts them in `.venv` (Linux), `install-windows.ps1` installs them, and the standalone builds include them. Without them the viewer works and the panel says what is missing.
 
+## MCP server (control from other apps)
+
+Other applications - Claude Code, Claude Desktop, Cursor, VS Code or your own scripts - can control Light-CSV over [MCP](https://modelcontextprotocol.io): open files, read and search rows, run DuckDB SQL over whole files, jump to rows, filter, freeze and hide columns, export matches and switch the theme. Everything except the Assistant.
+
+- On by default while the app is open, local to this PC only (`127.0.0.1` + a secret token). **Tools ▸ MCP server** turns it on or off.
+- **Tools ▸ Connect an app…** shows copy-ready setup for Claude Code, Claude Desktop (stdio, via the `csvview-mcp` bridge that also starts the app) and HTTP clients.
+- Full guide and tool list: [MCP.md](MCP.md).
+
 ## Limitations
 
 - Read-only; no editing.
