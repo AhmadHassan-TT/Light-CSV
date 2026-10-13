@@ -255,7 +255,7 @@ def settle(app, ms=60):
 
 def panelFor(window):
     """The window's own QueryPanel once app.py has the side panel; until then one in a test container."""
-    from PyQt6.QtWidgets import QVBoxLayout, QWidget
+    from PyQt6.QtWidgets import QWidget, QVBoxLayout, QWidget
     from csvviewer.query import openQueryBuilder
     from csvviewer.query.dialog import QueryPanel
     if hasattr(window, 'queryPanel'):
@@ -374,7 +374,10 @@ def testPanel(path, rows, shots):
     # Platform fonts decide the real minimum width, so check the rule rather than Linux pixel sizes
     sizes = [(f.width(), f.compact) for f in dlg.filters]
     assert all(c == (w < 400) or 400 <= w <= 440 for w, c in sizes), sizes
-    assert dlg.builderPane.width() <= dlg.width(), (dlg.builderPane.width(), dlg.width())
+    from PyQt6.QtWidgets import QWidget
+    widest = sorted(((c.minimumSizeHint().width(), type(c).__name__, c.objectName()) for c in dlg.builderPane.findChildren(QWidget)
+                     if c.isVisible()), reverse=True)[:6]
+    assert dlg.builderPane.width() <= dlg.width(), (dlg.builderPane.width(), dlg.width(), widest)
     assert dlg.scroll.horizontalScrollBar().maximum() == 0
     sizePanel(app, dlg, 1100)
     assert dlg.wide and dlg.split.orientation() == Qt.Orientation.Horizontal

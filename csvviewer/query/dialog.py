@@ -390,6 +390,8 @@ class QueryPanel(QWidget):
         outer.addLayout(top)
 
         self.builderPane = QWidget()
+        # Always as wide as the panel: platform styles (Windows) report larger minimum widths that would otherwise clip it
+        self.builderPane.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         pane = QVBoxLayout(self.builderPane)
         pane.setContentsMargins(0, 0, 4, 0)
         pane.setSpacing(4)
