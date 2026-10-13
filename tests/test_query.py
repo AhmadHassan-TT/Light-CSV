@@ -381,7 +381,9 @@ def testPanel(path, rows, shots):
     assert dlg.scroll.horizontalScrollBar().maximum() == 0
     sizePanel(app, dlg, 1100)
     assert dlg.wide and dlg.split.orientation() == Qt.Orientation.Horizontal
-    assert dlg.exportButton.text() == 'Export results…' and dlg.sqlBox.isVisible() and not dlg.buttonsWrapped
+    # Wrapping the buttons is fine where platform buttons are wider (Windows); labels and SQL must switch
+    assert dlg.exportButton.text() == 'Export results…', dlg.exportButton.text()
+    assert dlg.sqlBox.isVisible(), 'SQL preview hidden in the wide layout'
     sizePanel(app, dlg, 860)
     assert dlg.wide  # hysteresis: stays wide until under NARROW_AT
     sizePanel(app, dlg, 400)
