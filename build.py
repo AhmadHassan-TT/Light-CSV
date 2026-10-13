@@ -39,6 +39,28 @@ def buildBridge(targetDir):
     subprocess.run(args, check=True)
 
 
+def appVersion():
+    """The release version from the latest git tag (v1.2.0 -> 1.2.0)."""
+    try:
+        tag = subprocess.run(['git', 'describe', '--tags', '--abbrev=0'], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+        return tag.lstrip('v') or '1.0.0'
+    except (OSError, subprocess.CalledProcessError):
+        return '1.0.0'
+
+
+def stampMacApp(app):
+    """Real version and minimum macOS in Info.plist, then re-sign (ad hoc) since editing the bundle voids its signature."""
+    import plistlib
+    plist = os.path.join(app, 'Contents', 'Info.plist')
+    with open(plist, 'rb') as f:
+        info = plistlib.load(f)
+    version = appVersion()
+    info.update({'CFBundleShortVersionString': version, 'CFBundleVersion': version, 'LSMinimumSystemVersion': '12.0'})
+    with open(plist, 'wb') as f:
+        plistlib.dump(info, f)
+    subprocess.run(['codesign', '--force', '--deep', '--sign', '-', app], check=True)
+
+
 def packMac(distDir, name):
     """Zip CSV Viewer.app with the MCP bridge beside it (not inside: changing a built bundle breaks its signature)."""
     arch = platform.machine().lower()
@@ -46,6 +68,7 @@ def packMac(distDir, name):
     shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage)
     shutil.move(os.path.join(distDir, f'{name}.app'), os.path.join(stage, f'{name}.app'))
+    stampMacApp(os.path.join(stage, f'{name}.app'))
     buildBridge(stage)
     # ditto keeps the bundle's symlinks and signatures, which a plain zip would break ("app is damaged")
     zipPath = stage + '.zip'

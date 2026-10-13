@@ -17,6 +17,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags, for the app version
 
       - uses: actions/setup-python@v5
         with:
@@ -58,6 +60,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           file "$APP/Contents/MacOS/CSV Viewer"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist"
           python - "$APP" <<'PY'
           import json, os, subprocess, sys, time
           app = sys.argv[1]
