@@ -1,11 +1,12 @@
 """CSV Viewer: a tabbed, read-only viewer for very large CSV files (tested on 11 GB)."""
+import json
 import os
 import sys
 import threading
 from bisect import bisect_left, bisect_right
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QActionGroup, QColor, QIcon, QKeySequence, QPalette, QShortcut
+from PyQt6.QtCore import QAbstractTableModel, QEvent, QMimeData, QModelIndex, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QActionGroup, QColor, QDrag, QIcon, QKeySequence, QMouseEvent, QPalette, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
     QFileDialog, QFormLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
@@ -175,14 +176,77 @@ class CsvModel(QAbstractTableModel):
         return f'{self.dataRow(section) + 1:,}'
 
 
+COLUMN_MIME = 'application/x-lightcsv-column'
+
+
+class DragHeader(QHeaderView):
+    """Column header whose sections can be dragged out (e.g. into the Query panel's filters), like Studio 3T."""
+
+    def __init__(self, parent):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setSectionsClickable(True)
+        self.setHighlightSections(False)
+        self.pressPos = None
+
+    def onEdge(self, x):
+        # Near a section border the press resizes the column, so it never starts a drag
+        section = self.logicalIndexAt(x)
+        if section < 0:
+            return True
+        left = self.sectionViewportPosition(section)
+        return x - left < 5 or left + self.sectionSize(section) - x < 5
+
+    def mousePressEvent(self, event):
+        x = int(event.position().x())
+        self.pressPos = event.position().toPoint() if event.button() == Qt.MouseButton.LeftButton and not self.onEdge(x) else None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.pressPos is not None and (event.position().toPoint() - self.pressPos).manhattanLength() >= QApplication.startDragDistance():
+            section = self.logicalIndexAt(self.pressPos.x())
+            self.pressPos = None
+            if self.startColumnDrag(section):
+                # The drag consumed the release; end the header's own press so it stops selecting
+                release = QMouseEvent(QEvent.Type.MouseButtonRelease, event.position(), event.globalPosition(),
+                                      Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton, event.modifiers())
+                super().mouseReleaseEvent(release)
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.pressPos = None
+        super().mouseReleaseEvent(event)
+
+    def startColumnDrag(self, section):
+        model = self.model()
+        csvIndex = getattr(model, 'csv', None)
+        if section < 0 or not csvIndex or section >= len(model.columns):
+            return False
+        name = model.columns[section]
+        mime = QMimeData()
+        mime.setData(COLUMN_MIME, json.dumps({'path': csvIndex.path, 'column': name}).encode())
+        mime.setText(name)
+        # A small chip with the column name follows the cursor
+        label = QLabel(f'  {name}  ')
+        label.setStyleSheet('background: palette(highlight); color: palette(highlighted-text); border-radius: 4px; padding: 3px;')
+        label.adjustSize()
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(label.grab())
+        drag.exec(Qt.DropAction.CopyAction)
+        return True
+
+
 class FrozenTable(QTableView):
     """Table whose first N columns stay pinned on the left while scrolling sideways."""
 
     def __init__(self, model):
         super().__init__()
         self.frozenCount = 0
+        self.setHorizontalHeader(DragHeader(self))
         self.setModel(model)
         self.frozen = QTableView(self)
+        self.frozen.setHorizontalHeader(DragHeader(self.frozen))
         self.frozen.setModel(model)
         self.frozen.setSelectionModel(self.selectionModel())
         self.frozen.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -755,11 +819,21 @@ class CsvTab(QWidget):
             menu.addAction('Freeze columns up to here', lambda: self.freezeSpin.setValue(col + 1))
             menu.addAction('Search in this column', lambda: (self.columnBox.setCurrentIndex(col + 1), self.focusSearch()))
             menu.addAction('Fit width to content', lambda: self.fitColumns([col]))
+            menu.addSeparator()
+            name, path = self.model.columns[col], self.index.path
+            menu.addAction('Filter by this column in Query', lambda: self.toQuery('addFilterForColumn', path, name))
+            menu.addAction('Group by this column in Query', lambda: self.toQuery('addGroupForColumn', path, name))
+            menu.addSeparator()
         menu.addAction('Unfreeze all', lambda: self.freezeSpin.setValue(0))
         menu.addSeparator()
         menu.addAction('Columns…', self.columnsDialog)
         menu.addAction('Show all columns', self.showAllColumns)
         menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
+
+    def toQuery(self, method, path, column):
+        # Same as dragging the header into the Query panel
+        self.window.showSidePanel('query')
+        getattr(self.window.queryPanel, method)(path, column)
 
     def columnsDialog(self):
         if not self.index:
@@ -847,10 +921,24 @@ class MainWindow(QMainWindow):
         self.explorerDock.setObjectName('explorer')
         self.explorerDock.setWidget(self.explorer)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.explorerDock)
+        # One right-hand side panel with two tabs: the Assistant and the Query builder
+        self.sideDock = QDockWidget('Assistant', self)
+        self.sideDock.setObjectName('sidepanel')
+        self.sideTabs = QTabWidget()
+        self.sideTabs.setDocumentMode(True)
         from .assistant.agent import Assistant
-        self.assistant = Assistant(self)
+        from .query.dialog import QueryPanel
+        self.assistant = Assistant(self, self.sideDock)
+        self.queryPanel = QueryPanel(self)
+        self.sidePages = {'assistant': self.assistant.panel, 'query': self.queryPanel}
+        self.sideTabs.addTab(self.assistant.panel, '✦ Assistant')
+        self.sideTabs.addTab(self.queryPanel, '⊞ Query')
+        self.sideTabs.currentChanged.connect(lambda i: self.sideDock.setWindowTitle(self.sideTabs.tabText(i).split(' ', 1)[-1]))
+        self.sideDock.setWidget(self.sideTabs)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.sideDock)
+        self.sideDock.hide()
         askButton = QToolButton(text='✦ Assistant')
-        askButton.clicked.connect(self.assistant.toggleAction.trigger)
+        askButton.clicked.connect(lambda: self.showSidePanel('assistant', toggle=True))
         askButton.setToolTip('Ask the AI assistant about the open tabs (Ctrl+Shift+A)')
         askButton.setAutoRaise(True)
         corner = QWidget()
@@ -860,7 +948,7 @@ class MainWindow(QMainWindow):
         queryButton = QToolButton(text='⊞ Query')
         queryButton.setToolTip('Filter, group and summarize a whole file without writing SQL (Ctrl+Shift+Q)')
         queryButton.setAutoRaise(True)
-        queryButton.clicked.connect(self.openQueryBuilder)
+        queryButton.clicked.connect(lambda: self.showSidePanel('query', toggle=True))
         cornerLayout.addWidget(queryButton)
         cornerLayout.addWidget(askButton)
         cornerLayout.addWidget(self.tabs.cornerWidget(Qt.Corner.TopRightCorner))
@@ -906,6 +994,8 @@ class MainWindow(QMainWindow):
         explorerAct.setText('&Explorer panel')
         explorerAct.setShortcut('F4')
         view.addAction(explorerAct)
+        self.act(view, '&Assistant panel', lambda: self.showSidePanel('assistant', toggle=True), 'Ctrl+Shift+A')
+        self.act(view, '&Query builder panel', lambda: self.showSidePanel('query', toggle=True), 'Ctrl+Shift+Q')
         self.assistant.menuActions(view)
         self.detailAct = view.addAction('Cell &detail panel')
         self.detailAct.setShortcut('Ctrl+D')
@@ -933,7 +1023,7 @@ class MainWindow(QMainWindow):
         self.act(view, 'Ne&xt tab', lambda: self.cycleTab(1), [QKeySequence('Ctrl+Tab'), QKeySequence('Ctrl+PgDown')])
         self.act(view, 'Pre&vious tab', lambda: self.cycleTab(-1), [QKeySequence('Ctrl+Shift+Tab'), QKeySequence('Ctrl+PgUp')])
         tools = self.menuBar().addMenu('&Tools')
-        self.act(tools, '&Query builder…', self.openQueryBuilder, 'Ctrl+Shift+Q')
+        self.act(tools, '&Query builder', lambda: self.showSidePanel('query'))
         tools.addSeparator()
         self.mcp.menuActions(tools)
 
@@ -1012,9 +1102,18 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(0)
             self.setWindowTitle('CSV Viewer')
 
+    def showSidePanel(self, page, toggle=False):
+        """Show the side panel on the Assistant or Query tab; toggle hides it when that tab is already showing."""
+        widget = self.sidePages[page]
+        if toggle and self.sideDock.isVisible() and self.sideTabs.currentWidget() is widget:
+            self.sideDock.hide()
+            return
+        self.sideTabs.setCurrentWidget(widget)
+        self.sideDock.show()
+        self.sideDock.raise_()
+
     def openQueryBuilder(self):
-        from .query import openQueryBuilder
-        openQueryBuilder(self)
+        self.showSidePanel('query')
 
     def closeOthers(self, keep):
         tab = self.tabs.widget(keep)
@@ -1076,6 +1175,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.assistant.shutdown()
+        self.queryPanel.shutdown()
         self.mcp.stop()
         self.settings.setValue('window/geometry', self.saveGeometry())
         self.settings.setValue('window/state', self.saveState())

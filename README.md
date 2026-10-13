@@ -109,7 +109,7 @@ Each file opens in its own tab.
 | Ctrl+O / Ctrl+T | Open a file in a new tab |
 | Ctrl+W | Close tab |
 | Ctrl+Shift+W | Close all tabs (right-click a tab for Close others / Close tabs to the right) |
-| Ctrl+Shift+Q | Query builder |
+| Ctrl+Shift+Q | Query builder panel (Ctrl+Shift+A: Assistant panel) |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Shift+O | Reopen with options |
 | F4 | Toggle Explorer panel |
@@ -149,7 +149,9 @@ Measured on an 11 GB file with 160.6 million rows:
 
 ## Query builder
 
-**⊞ Query** (top right), **Tools ▸ Query builder…** or **Ctrl+Shift+Q** opens a window for questions about a whole file - no SQL needed:
+**⊞ Query** (top right) or **Ctrl+Shift+Q** opens the Query tab of the right-hand side panel (next to **✦ Assistant**, Ctrl+Shift+A; the same button or shortcut hides it again). It answers questions about a whole file - no SQL needed:
+
+- **Drag a column header** from the table into the panel, like Studio 3T: drop it on **Filter rows** to filter by it, on **Group & summarize** to group by it, or on **Show columns** to include it (from another tab, the panel switches to that file). Right-click a header ▸ **Filter by / Group by this column in Query** does the same.
 
 - **File:** pick any open tab.
 - **Show columns:** tick the columns you want.

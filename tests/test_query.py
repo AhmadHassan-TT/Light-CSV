@@ -1,4 +1,4 @@
-"""Query builder: SQL generation, the DuckDB engine and the dialog inside a real MainWindow.
+"""Query builder: SQL generation, the DuckDB engine and the QueryPanel inside a real MainWindow.
 Run: QT_QPA_PLATFORM=offscreen .venv/bin/python tests/test_query.py [screenshotDir]"""
 import csv
 import os
@@ -235,7 +235,7 @@ def testEngine(path, rows):
     print(f'engine ok ({N} rows, export + cancel + read-only)')
 
 
-# ---------- dialog ----------
+# ---------- panel ----------
 
 def waitFor(app, cond, timeout=30):
     end = time.monotonic() + timeout
@@ -246,10 +246,87 @@ def waitFor(app, cond, timeout=30):
         time.sleep(0.01)
 
 
-def testDialog(path, rows, shots):
+def settle(app, ms=60):
+    end = time.monotonic() + ms / 1000
+    while time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.005)
+
+
+def panelFor(window):
+    """The window's own QueryPanel once app.py has the side panel; until then one in a test container."""
+    from PyQt6.QtWidgets import QVBoxLayout, QWidget
+    from csvviewer.query import openQueryBuilder
+    from csvviewer.query.dialog import QueryPanel
+    if hasattr(window, 'queryPanel'):
+        panel = openQueryBuilder(window)
+        assert panel is window.queryPanel and openQueryBuilder(window) is panel
+        return panel
+    panel = QueryPanel(window)
+    host = QWidget()
+    host.setWindowTitle('Query')
+    QVBoxLayout(host).addWidget(panel)
+    host.resize(420, 820)
+    host.show()
+    panel.testHost = host  # keep it alive
+    return panel
+
+
+def sizePanel(app, panel, width, height=820):
+    # Float the dock (when docked) and size its window so the panel itself is width x height
+    from PyQt6.QtWidgets import QDockWidget
+    dock = panel.parentWidget()
+    while dock is not None and not isinstance(dock, QDockWidget):
+        dock = dock.parentWidget()
+    if dock is not None and not dock.isFloating():
+        dock.setFloating(True)
+        settle(app)
+    top = panel.window()
+    for _ in range(5):
+        top.resize(top.width() + width - panel.width(), top.height() + height - panel.height())
+        settle(app)
+        if abs(panel.width() - width) <= 2:
+            break
+    assert abs(panel.width() - width) <= 2, (panel.width(), width)
+    settle(app)
+
+
+def dragTo(app, widget, path, column, drop=True, mimeType=None):
+    """Synthetic header drag onto a widget: enter + move (+ drop); returns whether the widget took it."""
+    import json
+    from PyQt6.QtCore import QMimeData, QPointF, Qt
+    from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+    from PyQt6.QtWidgets import QApplication
+    from csvviewer.query.dialog import COLUMN_MIME
+    mime = QMimeData()
+    mime.setData(mimeType or COLUMN_MIME, json.dumps({'path': path, 'column': column}).encode('utf-8'))
+    mime.setText(column)
+    pos = widget.rect().center()
+    args = (Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    enter = QDragEnterEvent(pos, *args)
+    QApplication.sendEvent(widget, enter)
+    move = QDragMoveEvent(pos, *args)
+    QApplication.sendEvent(widget, move)
+    accepted = enter.isAccepted() and move.isAccepted()
+    if drop:
+        ev = QDropEvent(QPointF(pos), *args)
+        QApplication.sendEvent(widget, ev)
+        accepted = accepted and ev.isAccepted()
+    app.processEvents()
+    return accepted
+
+
+def dragLeave(app, widget):
+    from PyQt6.QtGui import QDragLeaveEvent
+    from PyQt6.QtWidgets import QApplication
+    QApplication.sendEvent(widget, QDragLeaveEvent())
+    settle(app, 150)
+
+
+def testPanel(path, rows, shots):
+    from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication
     from csvviewer.app import MainWindow
-    from csvviewer.query import openQueryBuilder
     app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
     window.show()
@@ -257,9 +334,10 @@ def testDialog(path, rows, shots):
     window.openPath(other)
     window.openPath(path)
     waitFor(app, lambda: all(window.tabs.widget(i).index.done for i in range(window.tabs.count())))
-    dlg = openQueryBuilder(window)
-    assert openQueryBuilder(window) is dlg and dlg.isVisible()
-    assert dlg.fileBox.currentData() == os.path.abspath(path) and dlg.fileBox.count() == 2
+    path, other = os.path.abspath(path), os.path.abspath(other)
+    dlg = panelFor(window)
+    waitFor(app, lambda: dlg.isVisible() and dlg.engine is not None)
+    assert dlg.fileBox.currentData() == path and dlg.fileBox.count() == 2
     waitFor(app, lambda: dlg.names == HEADER)
     assert dlg.runButton.isEnabled()
     dlg.addFilter('qty', '>=', '3')
@@ -287,30 +365,67 @@ def testDialog(path, rows, shots):
     dlg.runQuery()
     assert dlg.errorLabel.isVisible() and 'not a number' in dlg.errorLabel.text() and dlg.busy is None
     dlg.removeRow(dlg.filters, bad)
-    app.processEvents()
+    dlg.hideError()
+
+    # Narrow (side panel) and wide (floated / expanded) layouts
+    sizePanel(app, dlg, 380)
+    assert not dlg.wide and dlg.split.orientation() == Qt.Orientation.Vertical
+    assert dlg.exportButton.text() == 'Export…' and not dlg.sqlBox.isVisible() and dlg.sqlPeek.isVisible()
+    assert all(f.compact for f in dlg.filters) and dlg.builderPane.width() <= 380
+    assert dlg.scroll.horizontalScrollBar().maximum() == 0
+    sizePanel(app, dlg, 1100)
+    assert dlg.wide and dlg.split.orientation() == Qt.Orientation.Horizontal
+    assert dlg.exportButton.text() == 'Export results…' and dlg.sqlBox.isVisible() and not dlg.buttonsWrapped
+    sizePanel(app, dlg, 860)
+    assert dlg.wide  # hysteresis: stays wide until under NARROW_AT
+    sizePanel(app, dlg, 400)
+    assert not dlg.wide and dlg.split.orientation() == Qt.Orientation.Vertical
+    dlg.sqlToggle.click()
+    assert dlg.sqlBox.isVisible() and dlg.sqlChoice[False] is True
+    dlg.sqlToggle.click()
+    assert not dlg.sqlBox.isVisible()
+
     for theme in ('light', 'dark'):
         window.setTheme(theme)
-        dlg.runQuery()
-        waitFor(app, lambda: dlg.busy is None)
-        if theme == 'dark':
-            dlg.showError('Binder Error: Referenced column "amout" not found in FROM clause!\nCandidate bindings: "amount"')
-        app.processEvents()
+        for width in (400, 1100):
+            sizePanel(app, dlg, width)
+            dlg.runQuery()
+            waitFor(app, lambda: dlg.busy is None)
+            dlg.scroll.ensureWidgetVisible(dlg.groupZone, 0, 0)
+            if theme == 'dark' and width == 1100:
+                dlg.showError('Binder Error: Referenced column "amout" not found in FROM clause!\nCandidate bindings: "amount"')
+            settle(app)
+            if shots:
+                dlg.grab().save(os.path.join(shots, f'query-panel-{width}-{theme}.png'))
+            dlg.hideError()
+        # A drag hovering the filter section
+        sizePanel(app, dlg, 400)
+        dragTo(app, dlg.filterZone, path, 'amount', drop=False)
+        assert dlg.filterZone.property('dropHover') is True and dlg.dropHint.isVisible()
+        assert dlg.dropHint.text() == 'Drop to filter by amount', dlg.dropHint.text()
+        settle(app)
         if shots:
-            dlg.grab().save(os.path.join(shots, f'query-builder-{theme}.png'))
-    dlg.hideError()
+            dlg.grab().save(os.path.join(shots, f'query-panel-drag-{theme}.png'))
+        dragLeave(app, dlg.filterZone)
+        assert dlg.filterZone.property('dropHover') is False and not dlg.dropHint.isVisible()
+    window.setTheme('light')
+
     # Edit SQL mode runs the typed SQL; read-only check applies
     dlg.editSql.setChecked(True)
-    assert not dlg.builderPane.isEnabled() and not dlg.sqlBox.isReadOnly()
+    assert not dlg.builderPane.isEnabled() and not dlg.sqlBox.isReadOnly() and dlg.sqlBox.isVisible()
     dlg.sqlBox.setPlainText('DROP VIEW t2')
     dlg.runQuery()
     waitFor(app, lambda: dlg.busy is None)
     assert 'read-only' in dlg.errorLabel.text()
+    # Column drags are not builder drops while editing SQL
+    assert not dragTo(app, dlg.table.viewport(), path, 'city')
+    assert len(dlg.filters) == 2
     dlg.sqlBox.setPlainText('SELECT * FROM t2 ORDER BY id')
     dlg.limitSpin.setValue(0)
     dlg.runQuery()
     waitFor(app, lambda: dlg.busy is None)
     assert len(dlg.model.rows) == N and not dlg.errorLabel.isVisible()
-    # Stop a long query from the dialog
+    # Stop a long query from the panel
     dlg.sqlBox.setPlainText('SELECT count(*) FROM t2 a, t2 b, t2 c WHERE a.note || b.note <> c.city')
     dlg.runQuery()
     time.sleep(0.5)
@@ -320,6 +435,7 @@ def testDialog(path, rows, shots):
     dlg.editSql.setChecked(False)
     assert dlg.builderPane.isEnabled()
     # Open results as new tab: COPY into the data dir, then a new viewer tab
+    dlg.limitSpin.setValue(1000)
     tabsBefore = window.tabs.count()
     dlg.openAsTab()
     waitFor(app, lambda: dlg.busy is None)
@@ -336,18 +452,73 @@ def testDialog(path, rows, shots):
     waitFor(app, lambda: dlg.fileBox.count() == 3)
     window.closeTab(window.tabs.count() - 1)
     waitFor(app, lambda: dlg.fileBox.count() == 2)
-    assert dlg.fileBox.currentData() == os.path.abspath(path)
-    # Clear resets the builder; switching file reloads columns
+    assert dlg.fileBox.currentData() == path
+    # Clear resets the builder
     dlg.clear()
     assert not dlg.filters and not dlg.groups and dlg.sqlBox.toPlainText() == 'SELECT *\nFROM t2\nLIMIT 1000'
-    dlg.fileBox.setCurrentIndex(dlg.fileBox.findData(os.path.abspath(other)))
-    dlg.onFile()
-    waitFor(app, lambda: dlg.names == ['x', 'y'])
-    assert 'FROM t1' in dlg.sqlBox.toPlainText()
-    dlg.close()
-    assert window.settings.value('query/geometry') is not None
+
+    # ---- drag & drop ----
+    dlg.window().activateWindow()
+    settle(app)
+    assert dragTo(app, dlg.filterZone, path, 'city')
+    assert [f.state()['column'] for f in dlg.filters] == ['city'] and dlg.filters[0].state()['op'] == 'equals'
+    settle(app)
+    assert dlg.filters[0].value.hasFocus(), (QApplication.focusWidget(), QApplication.activeWindow(), dlg.window())
+    assert not dlg.filterZone.property('dropHover') and not dlg.dropHint.isVisible()
+    assert dragTo(app, dlg.filterZone, path, 'qty')  # numeric column -> numeric operators
+    assert dlg.filters[1].state()['op'] == '=' and dlg.filters[1].value.placeholderText() == 'a number'
+    # Onto a text box inside the zone: still a filter, the box's text is untouched
+    assert dragTo(app, dlg.filters[0].value, path, 'note')
+    assert [f.state()['column'] for f in dlg.filters] == ['city', 'qty', 'note'] and dlg.filters[0].value.text() == ''
+    # Anywhere else on the panel = filter
+    assert dragTo(app, dlg.table.viewport(), path, 'day')
+    assert dlg.filters[-1].state()['column'] == 'day' and len(dlg.filters) == 4
+    # Group zone, no duplicates; hover shows the hint
+    dragTo(app, dlg.groupZone, path, 'city', drop=False)
+    assert dlg.groupZone.property('dropHover') is True and dlg.dropHint.text() == 'Drop to group by city'
+    assert not dlg.filterZone.property('dropHover')
+    dragLeave(app, dlg.groupZone)
+    assert not dlg.groupZone.property('dropHover') and not dlg.dropHint.isVisible()
+    assert dragTo(app, dlg.groupZone, path, 'city') and dragTo(app, dlg.groupZone, path, 'city')
+    assert [g.state() for g in dlg.groups] == ['city'] and 'GROUP BY "city"' in dlg.sqlBox.toPlainText()
+    # Show columns: ticks the column (and clears a find text that hides it)
+    dlg.checkColumns(False)
+    dlg.columnFilter.setText('zzz')
+    dragTo(app, dlg.columnsZone, path, 'note', drop=False)
+    assert dlg.dropHint.text() == 'Drop to show note'
+    assert dragTo(app, dlg.columnsZone, path, 'note')
+    checked = [dlg.columnList.item(i).text() for i in range(dlg.columnList.count())
+               if dlg.columnList.item(i).checkState() == Qt.CheckState.Checked]
+    assert checked == ['note'] and dlg.columnFilter.text() == '' and dlg.columnList.currentItem().text() == 'note'
+    # Other mime types are ignored
+    before = (len(dlg.filters), len(dlg.groups))
+    for zone in (dlg.filterZone, dlg.groupZone, dlg.columnsZone, dlg.table.viewport()):
+        assert not dragTo(app, zone, path, 'id', mimeType='text/plain')
+    assert (len(dlg.filters), len(dlg.groups)) == before and not dlg.dropHint.isVisible()
+    # A column of another tab switches the file first, then applies
+    assert dragTo(app, dlg.groupZone, other, 'x')
+    waitFor(app, lambda: dlg.names == ['x', 'y'] and dlg.groups)
+    assert dlg.fileBox.currentData() == other and [g.state() for g in dlg.groups] == ['x'] and not dlg.filters
+    assert 'FROM t1' in dlg.sqlBox.toPlainText() and 'GROUP BY "x"' in dlg.sqlBox.toPlainText()
+    # The same actions without dragging (header right-click menu)
+    assert dlg.addFilterForColumn(path, 'amount') is None  # waits for the columns of the other file
+    waitFor(app, lambda: dlg.names == HEADER and dlg.filters)
+    assert dlg.fileBox.currentData() == path and [f.state()['column'] for f in dlg.filters] == ['amount']
+    assert dlg.addGroupForColumn(path, 'note').state() == 'note'
+    assert dlg.addFilterForColumn(None, 'CITY').state()['column'] == 'city'  # case-insensitive fallback
+    assert dlg.addFilterForColumn(path, 'nope') is None and 'no column "nope"' in dlg.errorLabel.text()
+    dlg.checkColumns(False)
+    assert dlg.showColumn(path, 'id').checkState() == Qt.CheckState.Checked
+    assert dlg.addFilterForColumn(os.path.join(TMP, 'closed.csv'), 'x') is None and 'not open' in dlg.errorLabel.text()
+    assert dlg.selectTabPath(other) and dlg.fileBox.currentData() == other
+    dlg.focusBuilder()
+    # Shutdown stops and closes the engine, keeps the layout; twice is fine
+    dlg.shutdown()
+    dlg.shutdown()
+    assert dlg.engine is None and dlg.closed
+    assert window.settings.value('query/splitNarrow') is not None and window.settings.value('query/splitWide') is not None
     window.close()
-    print('dialog ok')
+    print('panel ok (layouts, drops, side-panel actions)')
 
 
 def main():
@@ -357,7 +528,7 @@ def main():
     path = os.path.join(TMP, 'people.csv')
     rows = writeCsv(path)
     testEngine(path, rows)
-    testDialog(path, rows, shots)
+    testPanel(path, rows, shots)
     print('all query tests passed')
 
 

@@ -3,8 +3,7 @@ import json
 import threading
 
 from PyQt6.QtCore import QObject, QProcess, Qt, pyqtSignal
-from PyQt6.QtGui import QKeySequence
-from PyQt6.QtWidgets import QDockWidget, QMessageBox
+from PyQt6.QtWidgets import QMessageBox
 
 from . import auth, history
 from .providers import KEY_PROVIDERS
@@ -193,7 +192,7 @@ class Assistant(QObject):
     antReady = pyqtSignal(str)  # path of the downloaded ant CLI, or "error:..."
     keyChecked = pyqtSignal(str, bool, str, str)  # free-key check: providerId, ok, message, key
 
-    def __init__(self, window):
+    def __init__(self, window, dock):
         super().__init__(window)
         from .panel import AssistantPanel
         self.window = window
@@ -204,14 +203,7 @@ class Assistant(QObject):
         self.provider = auth.settings().value('assistant/provider', 'claude')
         self.chat = None  # the saved chat being shown (history.newChat dict)
         self.panel = AssistantPanel()
-        self.dock = QDockWidget('Assistant', window)
-        self.dock.setObjectName('assistant')
-        self.dock.setWidget(self.panel)
-        window.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
-        self.dock.hide()
-        self.toggleAction = self.dock.toggleViewAction()
-        self.toggleAction.setText('&Assistant')
-        self.toggleAction.setShortcut(QKeySequence('Ctrl+Shift+A'))
+        self.dock = dock  # the shared side panel; the main window puts self.panel in its Assistant tab
         self.panel.askRequested.connect(self.ask)
         self.panel.stopRequested.connect(self.stop)
         self.panel.newChatRequested.connect(self.newChat)
@@ -236,7 +228,6 @@ class Assistant(QObject):
         self.refreshAuth()
 
     def menuActions(self, menu):
-        menu.addAction(self.toggleAction)
         menu.addAction('Sign out of the assistant', self.signOut)
 
     # ---------- sign-in ----------
