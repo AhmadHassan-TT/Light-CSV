@@ -108,6 +108,8 @@ Each file opens in its own tab.
 |---|---|
 | Ctrl+O / Ctrl+T | Open a file in a new tab |
 | Ctrl+W | Close tab |
+| Ctrl+Shift+W | Close all tabs (right-click a tab for Close others / Close tabs to the right) |
+| Ctrl+Shift+Q | Query builder |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Shift+O | Reopen with options |
 | F4 | Toggle Explorer panel |
@@ -144,6 +146,21 @@ Measured on an 11 GB file with 160.6 million rows:
 | Random row access | ~0.3 ms |
 | Whole-file search | 4–8 s |
 | Memory | ~230 MB |
+
+## Query builder
+
+**⊞ Query** (top right), **Tools ▸ Query builder…** or **Ctrl+Shift+Q** opens a window for questions about a whole file - no SQL needed:
+
+- **File:** pick any open tab.
+- **Show columns:** tick the columns you want.
+- **Filter rows:** e.g. *status equals inService*, *amount ≥ 100*, *city contains calg*, *note is empty*; match **all** or **any** of the filters. Text matching ignores case.
+- **Group & summarize:** one row per group with Count, Count distinct, Sum, Average, Min or Max.
+- **Sort by** a column or summary, **Limit rows**, **Only distinct rows**.
+- **Run** (Ctrl+Enter) runs it with DuckDB over the full file - multi-GB files take seconds; **Stop** cancels.
+- **Export results…** writes the full result to a CSV; **Open results as new tab** opens it in the viewer.
+- The generated SQL is shown live; **Edit SQL** lets you change it by hand (read-only queries only; tab N is view `tN`).
+
+Needs the `duckdb` package (installed by `./install.sh` / `install-windows.ps1`, included in the standalone builds).
 
 ## Assistant (Claude, or free Google Gemini / Groq)
 

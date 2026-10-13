@@ -1,11 +1,11 @@
 """Client-side tools Claude calls to read the open CSV tabs; runs on the assistant's worker thread, never touches Qt."""
 import json
-import os
-import re
 import threading
 import time
 
+from csvviewer import sqlviews
 from csvviewer.index import Search
+from csvviewer.sqlviews import VIEW_REF
 
 MAX_CELL = 300
 MAX_GET = 100
@@ -30,9 +30,6 @@ SQL_DESCRIPTION = (
     "SUMMARIZE, SHOW, PRAGMA table_info, EXPLAIN. At most 200 result rows are returned (truncated=true when "
     "there were more); long cells are cut at 300 characters. Times out after 180 s.")
 
-READ_ONLY = re.compile(r'^\s*(select|with|from|describe|summarize|show|pragma\s+table_info|explain|values|\()', re.I)
-VIEW_REF = re.compile(r'\bt(\d+)(_text)?\b', re.I)
-
 
 class ToolError(Exception):
     pass
@@ -55,10 +52,6 @@ def humanSize(n):
 
 def dump(obj):
     return json.dumps(obj, ensure_ascii=False, default=str, separators=(',', ':'))
-
-
-def sqlString(text):
-    return "'" + text.replace("'", "''") + "'"
 
 
 def tool(name, description, props, required):
@@ -258,58 +251,33 @@ class CsvTools:
     # ---------- SQL ----------
 
     def connect(self):
-        try:
-            import duckdb
-        except ImportError:
-            raise ToolError('SQL is unavailable: duckdb not installed')
         with self.lock:
             if self.con is None:
-                con = duckdb.connect()
-                con.execute(f'SET threads={os.cpu_count() or 4}')
                 try:
-                    # 40% of RAM so the viewer and the OS keep room
-                    ram = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-                    con.execute(f"SET memory_limit='{int(ram * 0.4) >> 20}MiB'")
-                except (ValueError, OSError, AttributeError):
-                    pass
-                self.con = con
+                    self.con = sqlviews.connect()
+                except ImportError:
+                    raise ToolError('SQL is unavailable: duckdb not installed')
             return self.con
 
     def readCsv(self, tab, text=False):
-        idx = tab.index
-        enc = {'utf-8': 'utf-8', 'cp1252': 'latin-1'}.get(idx.encoding.lower(), 'utf-8')
-        args = [sqlString(tab.path), f'delim={sqlString(idx.delimiter)}', f'header={str(idx.hasHeader).lower()}',
-                "quote='\"'", "escape='\"'", f"encoding='{enc}'", 'strict_mode=false']
-        # DuckDB pads short lines only single-threaded when fields hold newlines, so only the text view pays that
-        args += ['all_varchar=true', 'null_padding=true', 'parallel=false'] if text else ['sample_size=100000', 'ignore_errors=true']
-        return f"read_csv({', '.join(args)})"
+        return sqlviews.readCsv(tab.path, tab.index, text)
 
     def ensureViews(self, con, query):
-        for m in VIEW_REF.finditer(query):
-            tabId, text = int(m.group(1)), bool(m.group(2))
-            name = f't{tabId}' + ('_text' if text else '')
+        for tabId, text in sqlviews.viewRefs(query):
+            name = sqlviews.viewName(tabId, text)
             if name in self.views or tabId not in self.tabs:
                 continue
             try:
-                con.execute(f'CREATE OR REPLACE VIEW {name} AS SELECT * FROM {self.readCsv(self.tabs[tabId], text)}')
+                tab = self.tabs[tabId]
+                sqlviews.createView(con, tabId, tab.path, tab.index, text)
             except Exception as e:
                 raise ToolError(f'could not open tab {tabId} for SQL: {e}')
             self.views.add(name)
 
     def checkReadOnly(self, con, query):
-        import duckdb
-        try:
-            stmts = con.extract_statements(query)
-        except duckdb.Error as e:
-            raise ToolError(str(e))
-        if len(stmts) != 1:
-            raise ToolError('send exactly one statement')
-        st = duckdb.StatementType
-        if stmts[0].type not in (st.SELECT, st.EXPLAIN) or not READ_ONLY.match(query):
-            raise ToolError('only read-only queries are allowed (SELECT, WITH, DESCRIBE, SUMMARIZE, PRAGMA table_info, EXPLAIN)')
-        # EXPLAIN ANALYZE runs its statement, so that must be read-only too
-        if stmts[0].type == st.EXPLAIN and not re.match(r'^\s*explain\s+(analyze\s+)?(select|with|from|\()', query, re.I):
-            raise ToolError('EXPLAIN is allowed for SELECT queries only')
+        error = sqlviews.readOnlyError(con, query)
+        if error:
+            raise ToolError(error)
 
     def tool_run_sql(self, query):
         con = self.connect()
@@ -348,7 +316,7 @@ class CsvTools:
         if self.timedOut:
             return f'query timed out after {SQL_TIMEOUT} s'
         # DuckDB appends its reader settings and fix hints; keep the cause only
-        msg = msg.split('\n  file =')[0].split('\nPossible fixes')[0].strip()
+        msg = sqlviews.shortError(msg)
         if 'Conversion Error' not in msg and 'Could not convert' not in msg:
             return msg
         ids = sorted({int(m.group(1)) for m in VIEW_REF.finditer(query) if int(m.group(1)) in self.tabs})

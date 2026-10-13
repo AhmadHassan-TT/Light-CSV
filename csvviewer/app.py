@@ -826,6 +826,8 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.setElideMode(Qt.TextElideMode.ElideMiddle)
         self.tabs.tabCloseRequested.connect(self.closeTab)
+        self.tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabs.tabBar().customContextMenuRequested.connect(self.tabMenu)
         self.tabs.currentChanged.connect(self.onTabChanged)
         newTab = QToolButton(text='+', toolTip='Open a file in a new tab (Ctrl+T)')
         newTab.setAutoRaise(True)
@@ -855,6 +857,11 @@ class MainWindow(QMainWindow):
         cornerLayout = QHBoxLayout(corner)
         cornerLayout.setContentsMargins(0, 0, 4, 0)
         cornerLayout.setSpacing(2)
+        queryButton = QToolButton(text='⊞ Query')
+        queryButton.setToolTip('Filter, group and summarize a whole file without writing SQL (Ctrl+Shift+Q)')
+        queryButton.setAutoRaise(True)
+        queryButton.clicked.connect(self.openQueryBuilder)
+        cornerLayout.addWidget(queryButton)
         cornerLayout.addWidget(askButton)
         cornerLayout.addWidget(self.tabs.cornerWidget(Qt.Corner.TopRightCorner))
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
@@ -883,6 +890,8 @@ class MainWindow(QMainWindow):
         self.act(file, '&Export matching rows…', lambda: self.onTab('exportMatches'), 'Ctrl+E')
         file.addSeparator()
         self.act(file, '&Close tab', lambda: self.closeTab(self.tabs.currentIndex()), QKeySequence('Ctrl+W'))
+        self.act(file, 'Close &other tabs', lambda: self.closeOthers(self.tabs.currentIndex()))
+        self.act(file, 'Close &all tabs', self.closeAll, QKeySequence('Ctrl+Shift+W'))
         self.act(file, '&Quit', self.close, QKeySequence.StandardKey.Quit)
         edit = self.menuBar().addMenu('&Edit')
         self.act(edit, '&Copy', lambda: self.onTab('copySelection'), QKeySequence.StandardKey.Copy)
@@ -924,6 +933,8 @@ class MainWindow(QMainWindow):
         self.act(view, 'Ne&xt tab', lambda: self.cycleTab(1), [QKeySequence('Ctrl+Tab'), QKeySequence('Ctrl+PgDown')])
         self.act(view, 'Pre&vious tab', lambda: self.cycleTab(-1), [QKeySequence('Ctrl+Shift+Tab'), QKeySequence('Ctrl+PgUp')])
         tools = self.menuBar().addMenu('&Tools')
+        self.act(tools, '&Query builder…', self.openQueryBuilder, 'Ctrl+Shift+Q')
+        tools.addSeparator()
         self.mcp.menuActions(tools)
 
     def setTheme(self, theme):
@@ -1000,6 +1011,42 @@ class MainWindow(QMainWindow):
         if not self.tabs.count():
             self.stack.setCurrentIndex(0)
             self.setWindowTitle('CSV Viewer')
+
+    def openQueryBuilder(self):
+        from .query import openQueryBuilder
+        openQueryBuilder(self)
+
+    def closeOthers(self, keep):
+        tab = self.tabs.widget(keep)
+        for i in reversed(range(self.tabs.count())):
+            if self.tabs.widget(i) is not tab:
+                self.closeTab(i)
+
+    def closeToRight(self, i):
+        for j in reversed(range(i + 1, self.tabs.count())):
+            self.closeTab(j)
+
+    def closeAll(self):
+        for i in reversed(range(self.tabs.count())):
+            self.closeTab(i)
+
+    def tabMenu(self, pos):
+        i = self.tabs.tabBar().tabAt(pos)
+        if i < 0:
+            return
+        count = self.tabs.count()
+        menu = QMenu(self)
+        menu.addAction('Close', lambda: self.closeTab(i))
+        menu.addAction('Close other tabs', lambda: self.closeOthers(i)).setEnabled(count > 1)
+        menu.addAction('Close tabs to the right', lambda: self.closeToRight(i)).setEnabled(i < count - 1)
+        menu.addSeparator()
+        menu.addAction('Close all tabs', self.closeAll)
+        tab = self.tabs.widget(i)
+        if tab.index:
+            menu.addSeparator()
+            menu.addAction('Copy file path', lambda: QApplication.clipboard().setText(tab.index.path))
+            menu.addAction('Show in Explorer panel', lambda: (self.explorerDock.show(), self.explorer.revealFile(tab.index.path)))
+        menu.exec(self.tabs.tabBar().mapToGlobal(pos))
 
     def cycleTab(self, step):
         if self.tabs.count():
