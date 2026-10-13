@@ -168,7 +168,7 @@ def testServer(server, registry):
 def runBridge(lines, env=None, timeout=30):
     """Feeds lines to csvview_mcp.py; returns its stdout messages (one JSON per line) and stderr."""
     proc = subprocess.run([sys.executable, os.path.join(repo, 'csvview_mcp.py')],
-                          input='\n'.join(json.dumps(m) for m in lines) + '\n', capture_output=True, text=True,
+                          input='\n'.join(json.dumps(m) for m in lines) + '\n', capture_output=True, text=True, encoding='utf-8',
                           timeout=timeout, env={**os.environ, **(env or {})})
     out = [json.loads(line) for line in proc.stdout.splitlines()]
     assert len(out) == len(proc.stdout.splitlines())

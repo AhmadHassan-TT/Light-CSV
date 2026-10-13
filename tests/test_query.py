@@ -325,7 +325,10 @@ def testDialog(path, rows, shots):
     waitFor(app, lambda: dlg.busy is None)
     assert window.tabs.count() == tabsBefore + 1, dlg.errorLabel.text()
     newPath = window.tabs.currentWidget().index.path
-    assert newPath.startswith(os.environ['XDG_DATA_HOME']) and 'query-results' in newPath
+    # The app data dir (XDG_DATA_HOME on Linux, AppData on Windows)
+    from PyQt6.QtCore import QStandardPaths
+    dataDir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+    assert os.path.normcase(newPath).startswith(os.path.normcase(dataDir)) and 'query-results' in newPath, (newPath, dataDir)
     with open(newPath, newline='', encoding='utf-8') as f:
         back = list(csv.reader(f))
     assert back[0] == ['city', 'Count', 'Average of amount'] and len(back) - 1 == len(want)
