@@ -728,6 +728,7 @@ class CsvTab(QWidget):
         return dataRow if rows is None else bisect_left(rows, dataRow)
 
     def jumpToDataRow(self, dataRow, col=None):
+        self.firstJumpPending = False  # an explicit jump wins over a search's pending jump to its first match
         total = self.model.virtualTotal()
         if total:
             self.jumpTo(min(self.virtualOf(dataRow), total - 1), col)
