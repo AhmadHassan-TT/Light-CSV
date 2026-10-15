@@ -46,6 +46,7 @@ jobs:
           python tests/test_mcp_server.py
           python tests/test_mcp_tools.py
           python tests/test_query.py
+          python tests/test_filters.py
         env:
           QT_QPA_PLATFORM: offscreen
 

@@ -480,10 +480,10 @@ class Assistant(QObject):
         if tab is None or not tab.index:
             return
         self.window.tabs.setCurrentWidget(tab)
-        if tab.model.rowMap is not None:
+        if tab.onlyMatches.isChecked():
             tab.onlyMatches.setChecked(False)
         col = tab.model.columns.index(column) if column in tab.model.columns else None
-        tab.jumpTo(row - 1, col)
+        tab.jumpToDataRow(row - 1, col)
 
     def shutdown(self):
         if self.worker:

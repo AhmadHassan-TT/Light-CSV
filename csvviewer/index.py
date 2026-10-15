@@ -5,14 +5,17 @@ import os
 import threading
 from array import array
 from bisect import bisect_right
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from itertools import islice
 
 import numpy as np
 
 INDEX_CHUNK = 64 << 20  # bytes scanned per indexing step
 SEARCH_CHUNK = 4 << 20  # bytes scanned per search step (small so the UI stays responsive)
+FILTER_CHUNK = 16 << 20  # bytes per column-filter step
+MAX_DISTINCT = 50_000  # a filter list stops collecting new values past this
 CACHE_BLOCKS = 512
-NL, QUOTE = 10, 34
+NL, CR, QUOTE = 10, 13, 34
 
 
 def sniffDelimiter(sample):
@@ -283,6 +286,134 @@ class Search:
             return False
         cell = row[self.column]
         return self.term in cell if self.caseSensitive else self.term.lower() in cell.lower()
+
+
+class ColumnScan:
+    """Tests column filters on every row in a background thread, like Excel's AutoFilter.
+
+    filters: {col: (mode, values)} with mode 'in' / 'out' (a set of raw cell bytes) or 'contains' (lower-case bytes).
+    Without `count`, hits are the matching data rows in file order. With `count=col`, it counts that column's values
+    among the rows the other filters keep; `values` is a {bytes: rows} snapshot that grows while scanning.
+    """
+
+    def __init__(self, index, filters, count=None):
+        self.index = index
+        self.filters = {c: f for c, f in filters.items() if c != count}
+        self.count = count
+        self.hits = array('q')
+        self.values = {}
+        self.capped = False
+        self.progress = 0.0
+        self.done = False
+        self.cancelled = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def cancel(self):
+        self.cancelled = True
+
+    def run(self):
+        with open(self.index.path, 'rb') as f:
+            self.scan(f)
+        self.progress = 1.0
+        self.done = True
+
+    def scan(self, f):
+        idx = self.index
+        total, block = idx.rowsIndexed, idx.block
+        offsetRow = 1 if idx.hasHeader else 0
+        nBlocks = len(idx.blockStarts)
+        avg = max(1, (idx.indexedEnd - idx.start) // max(1, total))
+        step = max(1, FILTER_CHUNK // (avg * block))
+        cols = sorted(set(self.filters) | ({self.count} if self.count is not None else set()))
+        counts = Counter()
+        for b in range(0, nBlocks, step):
+            if self.cancelled:
+                return
+            e = b + step
+            start = idx.blockStarts[b]
+            end = idx.blockStarts[e] if e < nBlocks else idx.indexedEnd
+            firstRow = b * block
+            nRows = min(e * block, total) - firstRow
+            if nRows <= 0:
+                break
+            f.seek(start)
+            fields = self.fields(f.read(end - start), nRows, cols)
+            keep = np.ones(nRows, bool)
+            keep[:max(0, offsetRow - firstRow)] = False
+            for c, (mode, values) in self.filters.items():
+                vals = fields[c]
+                if mode == 'contains':
+                    ok = (values in v.lower() for v in vals)
+                elif mode == 'in':
+                    ok = (v in values for v in vals)
+                else:
+                    ok = (v not in values for v in vals)
+                keep &= np.fromiter(ok, bool, nRows)
+            rows = np.flatnonzero(keep)
+            if self.count is None:
+                self.hits.frombytes((rows + (firstRow - offsetRow)).astype(np.int64).tobytes())
+            else:
+                vals = fields[self.count]
+                counts.update(vals if len(rows) == nRows else [vals[i] for i in rows.tolist()])
+                if len(counts) > MAX_DISTINCT:
+                    self.values = dict(islice(counts.items(), MAX_DISTINCT))
+                    self.capped = True
+                    return
+                self.values = dict(counts)
+            self.progress = min(1.0, (end - idx.start) / max(1, idx.indexedEnd - idx.start))
+
+    def fields(self, data, nRows, cols):
+        """{col: [raw cell bytes per row]} for a run of whole rows, as the csv parser would read them."""
+        idx = self.index
+        buf = np.frombuffer(data, np.uint8)
+        nl = np.flatnonzero(buf == NL)
+        delims = np.flatnonzero(buf == idx.delimiter.encode(idx.encoding)[0])
+        quotes = np.flatnonzero(buf == QUOTE)
+        if idx.quoteAware and len(quotes):
+            # Like the index: newlines and delimiters count only outside quotes (an even number of quotes before them)
+            nl = nl[(np.searchsorted(quotes, nl) & 1) == 0]
+            delims = delims[(np.searchsorted(quotes, delims) & 1) == 0]
+        starts = np.zeros(nRows, np.int64)
+        starts[1:] = nl[:nRows - 1] + 1
+        ends = np.full(nRows, len(buf), np.int64)
+        m = min(len(nl), nRows)
+        ends[:m] = nl[:m]
+        if len(buf):
+            ends -= (ends > starts) & (buf[np.maximum(ends - 1, 0)] == CR)
+        first = np.searchsorted(delims, starts)
+        inRow = np.searchsorted(delims, ends) - first
+        last = max(0, len(delims) - 1)
+        out, parsed = {}, {}
+        for k in cols:
+            if not len(delims):
+                fs, fe = (starts, ends) if k == 0 else (ends, ends)
+            else:
+                fs = starts if k == 0 else np.where(inRow >= k, delims[np.minimum(first + k - 1, last)] + 1, ends)
+                fe = np.where(inRow > k, delims[np.minimum(first + k, last)], ends)
+            vals = out[k] = [data[s:e] for s, e in zip(fs.tolist(), fe.tolist())]
+            if not len(quotes):
+                continue
+            if idx.quoteAware:
+                odd = np.flatnonzero(np.searchsorted(quotes, fe) > np.searchsorted(quotes, fs))
+            else:
+                # Without quote handling the delimiters inside quotes were counted too, so re-read past the first quote
+                q = np.searchsorted(quotes, starts)
+                odd = np.flatnonzero((q < len(quotes)) & (quotes[np.minimum(q, len(quotes) - 1)] < np.minimum(fe + 1, ends)))
+            for i in odd.tolist():
+                v = vals[i]
+                inner = v[1:-1]
+                if idx.quoteAware and len(v) >= 2 and v[0] == QUOTE and v[-1] == QUOTE and b'"' not in inner.replace(b'""', b''):
+                    vals[i] = inner.replace(b'""', b'"')
+                    continue
+                row = parsed.get(i)
+                if row is None:
+                    row = parsed[i] = idx.parse(data[starts[i]:ends[i]])
+                vals[i] = row[k].encode(idx.encoding, 'replace') if k < len(row) else b''
+        return out
 
 
 class Export:

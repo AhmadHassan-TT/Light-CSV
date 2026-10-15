@@ -428,11 +428,11 @@ class McpTools(QObject):
                 more = '' if tab.index.done else ' so far (still indexing)'
                 raise McpError(f'row {row} is out of range; tab {tabId} has rows 1-{rows}{more}')
             col = self.columnIndex(tab, column) if column else None
-            if tab.model.rowMap is not None:
+            if tab.onlyMatches.isChecked():
                 tab.onlyMatches.setChecked(False)
             self.window.tabs.setCurrentIndex(tabId - 1)
             tab.model.sync()
-            tab.jumpTo(row - 1, col)
+            tab.jumpToDataRow(row - 1, col)
             return {'tabId': tabId, 'current': self.currentCell(tab)}
         return self.gui(go)
 

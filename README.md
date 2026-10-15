@@ -101,7 +101,15 @@ Each file opens in its own tab.
   header ▸ **Freeze columns up to here**.
 - **Search the whole file** — optional column scope and **Match case** (case folding is ASCII-only).
   **Show only matches** filters the view to matching rows; **Stop** cancels a running search.
-- **Export matching rows** to a new CSV.
+- **Column filters (like Excel)** — right-click a column header ▸ **Add filter dropdown** (or
+  **Edit ▸ Filter this column**, Ctrl+Shift+F) puts a ▾ button on that column only. Click it for a
+  list of the column's values with row counts: search, tick / untick, **OK**. Filters on several
+  columns combine; each list only shows values from the rows the other filters keep. Right-click a
+  cell for **Filter to "value"** / **Hide rows with "value"**. **Clear filters** (bottom bar) shows
+  every row again; **Remove** in the dropdown takes the button away. Columns with more than 50,000
+  different values list the first 50,000; type in the search box and press OK to keep every row
+  containing that text.
+- **Export matching rows** to a new CSV (with column filters on: the filtered rows).
 - **Cell detail panel** — shows the full value of the current cell.
 - **Light / dark theme** — **View ▸ Theme**: System, Light or Dark (Ctrl+Shift+L toggles). The
   choice is remembered.
@@ -131,7 +139,8 @@ Each file opens in its own tab.
 | Ctrl+F | Focus the search box |
 | Enter / F3 | Find / next match |
 | Shift+Enter / Shift+F3 | Previous match |
-| Ctrl+E | Export matching rows |
+| Ctrl+E | Export matching rows (or the filtered rows) |
+| Ctrl+Shift+F | Filter the current column (adds its ▾ dropdown) |
 
 **Navigation and view**
 
@@ -200,5 +209,6 @@ Other applications - Claude Code, Claude Desktop, Cursor, VS Code or your own sc
 
 - Read-only; no editing.
 - No sorting.
-- Search is available once indexing has finished.
+- Search and column filters are available once indexing has finished. A filter reads the whole
+  file in the background (roughly 2 million rows a second); the rows show up while it runs.
 - Files over 50 million rows are shown 50 million rows at a time; switch with the "Rows …" selector at the bottom right. Go to row, search and Ctrl+End switch automatically.

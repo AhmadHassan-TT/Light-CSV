@@ -5,7 +5,8 @@ import sys
 import threading
 from bisect import bisect_left, bisect_right
 
-from PyQt6.QtCore import QAbstractTableModel, QEvent, QMimeData, QModelIndex, QSettings, Qt, QTimer, pyqtSignal
+import numpy as np
+from PyQt6.QtCore import QAbstractTableModel, QEvent, QMimeData, QModelIndex, QRect, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QActionGroup, QColor, QDrag, QIcon, QKeySequence, QMouseEvent, QPalette, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
@@ -15,9 +16,11 @@ from PyQt6.QtWidgets import (
 )
 
 from .explorer import Explorer
-from .index import CsvIndex, Export, Search
+from .filters import FilterPopup
+from .index import ColumnScan, CsvIndex, Export, Search
 
 ROW_HEIGHT = 22
+FILTER_BUTTON = 18  # width of the ▾ button on a filtered column's header
 MAX_CELL_CHARS = 500
 MAX_COPY_CELLS = 200_000
 # Qt measures the table in 32-bit pixels, so one view holds at most ~97M rows; bigger files are shown in segments
@@ -91,12 +94,14 @@ class CsvModel(QAbstractTableModel):
         self.columns = []
         self.rows = 0
         self.base = 0  # first virtual row of the segment on screen
-        self.rowMap = None  # search hits when "only matches" is on
+        self.rowMap = None  # rows on screen when filtered or "only matches" is on
+        self.filterCols = {}  # col -> True when its dropdown filters rows, False when it shows every row
 
     def load(self, csv):
         self.beginResetModel()
         self.csv = csv
         self.rowMap = None
+        self.filterCols = {}
         self.rows = 0
         self.base = 0
         self.columns = []
@@ -142,7 +147,7 @@ class CsvModel(QAbstractTableModel):
         return self.base + viewRow
 
     def dataRow(self, viewRow):
-        return self.rowMap[self.base + viewRow] if self.rowMap is not None else self.base + viewRow
+        return int(self.rowMap[self.base + viewRow]) if self.rowMap is not None else self.base + viewRow
 
     def fileRow(self, viewRow):
         return self.dataRow(viewRow) + (1 if self.csv.hasHeader else 0)
@@ -180,7 +185,12 @@ COLUMN_MIME = 'application/x-lightcsv-column'
 
 
 class DragHeader(QHeaderView):
-    """Column header whose sections can be dragged out (e.g. into the Query panel's filters), like Studio 3T."""
+    """Column header whose sections can be dragged out (e.g. into the Query panel's filters), like Studio 3T.
+
+    Columns with a filter dropdown get a ▾ button on the right, like Excel; clicking it emits filterClicked.
+    """
+
+    filterClicked = pyqtSignal(object, int)
 
     def __init__(self, parent):
         super().__init__(Qt.Orientation.Horizontal, parent)
@@ -196,8 +206,39 @@ class DragHeader(QHeaderView):
         left = self.sectionViewportPosition(section)
         return x - left < 5 or left + self.sectionSize(section) - x < 5
 
+    def filterState(self, section):
+        return getattr(self.model(), 'filterCols', {}).get(section)
+
+    def onFilterButton(self, x):
+        section = self.logicalIndexAt(x)
+        if section < 0 or self.filterState(section) is None:
+            return -1
+        right = self.sectionViewportPosition(section) + self.sectionSize(section)
+        return section if right - FILTER_BUTTON - 2 <= x < right - 2 else -1
+
+    def paintSection(self, painter, rect, section):
+        super().paintSection(painter, rect, section)
+        state = self.filterState(section)
+        if state is None or rect.width() < FILTER_BUTTON + 8:
+            return
+        box = QRect(rect.right() - FILTER_BUTTON - 1, rect.top() + 3, FILTER_BUTTON, rect.height() - 6)
+        pal = self.palette()
+        painter.save()
+        painter.setPen(pal.color(QPalette.ColorRole.Mid))
+        painter.setBrush(pal.color(QPalette.ColorRole.Highlight if state else QPalette.ColorRole.Button))
+        painter.drawRoundedRect(box, 3, 3)
+        painter.setPen(pal.color(QPalette.ColorRole.HighlightedText if state else QPalette.ColorRole.ButtonText))
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, '⏷' if state else '▾')
+        painter.restore()
+
     def mousePressEvent(self, event):
         x = int(event.position().x())
+        if event.button() == Qt.MouseButton.LeftButton:
+            section = self.onFilterButton(x)
+            if section >= 0:
+                self.pressPos = None
+                self.filterClicked.emit(self, section)
+                return
         self.pressPos = event.position().toPoint() if event.button() == Qt.MouseButton.LeftButton and not self.onEdge(x) else None
         super().mousePressEvent(event)
 
@@ -406,6 +447,11 @@ class CsvTab(QWidget):
         self.export = None
         self.indexThread = None
         self.lastQuery = None
+        self.filters = {}  # col -> filter spec (see ColumnScan), or None for a dropdown that shows every row
+        self.filterScan = None  # finds the rows the filters keep
+        self.filterRows = None  # its hits as a numpy array once it is done
+        self.valueScans = {}  # (col, other filters) -> ColumnScan counting that column's values
+        self.mapPending = False  # filters plus "only matches" wait for both scans to intersect them
         self.columnsReady = False
         self.firstJumpPending = False
         self.model = CsvModel()
@@ -443,6 +489,14 @@ class CsvTab(QWidget):
         self.segmentBox.activated.connect(lambda i: self.showSegment(i * SEGMENT))
         self.segmentBox.hide()
         info.addWidget(self.segmentBox)
+        self.filterLabel = QLabel('')
+        self.filterLabel.hide()
+        info.addWidget(self.filterLabel)
+        self.clearFiltersBtn = QToolButton(text='Clear filters')
+        self.clearFiltersBtn.setToolTip('Show every row again (the dropdowns stay)')
+        self.clearFiltersBtn.clicked.connect(self.clearFilters)
+        self.clearFiltersBtn.hide()
+        info.addWidget(self.clearFiltersBtn)
         info.addWidget(self.cellLabel)
         info.addWidget(self.progress)
         layout = QVBoxLayout(self)
@@ -453,9 +507,13 @@ class CsvTab(QWidget):
         layout.addLayout(info)
         self.table.selectionModel().currentChanged.connect(self.onCurrentChanged)
         self.table.doubleClicked.connect(lambda _: self.setDetailVisible(True))
-        hdr = self.table.horizontalHeader()
-        hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        hdr.customContextMenuRequested.connect(self.headerMenu)
+        for view in (self.table, self.table.frozen):
+            hdr = view.horizontalHeader()
+            hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            hdr.customContextMenuRequested.connect(lambda pos, h=hdr: self.headerMenu(pos, h))
+            hdr.filterClicked.connect(self.openFilter)
+            view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            view.customContextMenuRequested.connect(lambda pos, v=view: self.cellMenu(v, pos))
 
     def buildSearchBar(self):
         bar = self.searchBar = QHBoxLayout()
@@ -556,6 +614,7 @@ class CsvTab(QWidget):
         self.lastQuery = None
         self.onlyMatches.setChecked(False)
         self.matchLabel.setText('')
+        self.resetFilters()
         if self.index:
             self.index.cancelled = True
             if self.indexThread:
@@ -605,6 +664,7 @@ class CsvTab(QWidget):
         delim = {'\t': 'tab', ',': 'comma', ';': 'semicolon', '|': 'pipe'}.get(idx.delimiter, repr(idx.delimiter))
         self.infoLabel.setText(f'{idx.path}  ·  {humanSize(idx.size)}  ·  {idx.dataRows:,} rows  ·  '
                                f'{self.model.columnCount()} columns  ·  {delim}  ·  {idx.encoding}{state}')
+        self.updateFilterStatus()
         s = self.search
         if s:
             if s.done:
@@ -662,15 +722,23 @@ class CsvTab(QWidget):
         self.table.scrollTo(target, QAbstractItemView.ScrollHint.PositionAtCenter)
         self.table.setFocus()
 
+    def virtualOf(self, dataRow):
+        """Position of a data row on screen; when filtered, the first visible row at or after it."""
+        rows = self.model.rowMap
+        return dataRow if rows is None else bisect_left(rows, dataRow)
+
+    def jumpToDataRow(self, dataRow, col=None):
+        total = self.model.virtualTotal()
+        if total:
+            self.jumpTo(min(self.virtualOf(dataRow), total - 1), col)
+
     def gotoRow(self):
         if not self.index:
             return
-        if self.model.rowMap is not None:
-            self.onlyMatches.setChecked(False)
-        total = self.model.virtualTotal()
+        total = self.index.dataRows
         row, ok = QInputDialog.getInt(self, 'Go to row', f'Row number (1 – {total:,})', 1, 1, max(1, total))
         if ok:
-            self.jumpTo(row - 1)
+            self.jumpToDataRow(row - 1)
 
     def onCurrentChanged(self, current, _previous):
         if not current.isValid() or not self.index:
@@ -721,15 +789,10 @@ class CsvTab(QWidget):
         s = self.search
         if not s or not self.firstJumpPending:
             return
-        if len(s.hits):
+        hit = self.nextHit(-1 if self.onlyMatches.isChecked() else self.currentDataRow(), 1)
+        if hit is not None:
             self.firstJumpPending = False
-            if self.model.rowMap is None:
-                cur = self.table.currentIndex()
-                start = self.model.dataRow(cur.row()) if cur.isValid() else -1
-                i = bisect_right(s.hits, start)
-                self.jumpTo(s.hits[i] if i < len(s.hits) else s.hits[0], self.matchColumn())
-            else:
-                self.jumpTo(0, self.matchColumn())
+            self.jumpTo(self.virtualOf(hit), self.matchColumn())
         elif not s.done:
             QTimer.singleShot(300, self.jumpToFirst)
 
@@ -749,22 +812,53 @@ class CsvTab(QWidget):
         self.matchLabel.setText('')
         self.onlyMatches.setChecked(False)
 
-    def applyFilter(self, on):
+    def applyFilter(self, _on=None):
+        """Show the rows the column filters keep, intersected with the search hits when "Only matches" is on."""
         if not self.index:
             return
         cur = self.table.currentIndex()
         keep = self.model.dataRow(cur.row()) if cur.isValid() else None
-        if on and self.search:
-            self.model.setRowMap(self.search.hits)
-            if keep is not None:
-                i = bisect_left(self.search.hits, keep)
-                if i < len(self.search.hits):
-                    self.jumpTo(i, cur.column())
-        else:
-            self.model.setRowMap(None)
-            if keep is not None:
-                self.jumpTo(keep, cur.column())
+        s = self.search if self.onlyMatches.isChecked() else None
+        rows = self.filterScan.hits if self.filterScan else None
+        self.mapPending = False
+        if s and rows is not None:
+            if s.done and self.filterRows is not None:
+                rows = np.intersect1d(np.frombuffer(s.hits, np.int64), self.filterRows, assume_unique=True)
+            else:
+                self.mapPending = True  # the filter rows show until both scans are done
+        elif s:
+            rows = s.hits
+        self.model.setRowMap(rows)
+        if keep is not None:
+            self.jumpToDataRow(keep, cur.column())
         self.table.refreshFrozen()
+
+    def currentDataRow(self):
+        cur = self.table.currentIndex()
+        return self.model.dataRow(cur.row()) if cur.isValid() else -1
+
+    def nextHit(self, here, step):
+        """The next search hit after (step 1) or before (step -1) a data row that the filters keep, wrapping around."""
+        hits = self.search.hits if self.search else ()
+        n = len(hits)
+        if not n:
+            return None
+        keep = self.filterRows if self.filterScan else None
+        if keep is not None and not len(keep):
+            return None
+        i = bisect_right(hits, here) if step > 0 else bisect_left(hits, here)
+        spans = ((i, n), (0, i)) if step > 0 else ((0, i), (i, n))
+        for lo, hi in spans:
+            edges = range(lo, hi, 65536) if step > 0 else range(hi, lo, -65536)
+            for edge in edges:
+                a, b = (edge, min(edge + 65536, hi)) if step > 0 else (max(lo, edge - 65536), edge)
+                cand = np.frombuffer(hits[a:b], np.int64)
+                if keep is not None:
+                    j = np.minimum(np.searchsorted(keep, cand), len(keep) - 1)
+                    cand = cand[keep[j] == cand]
+                if len(cand):
+                    return int(cand[0] if step > 0 else cand[-1])
+        return None
 
     def nextMatch(self):
         self.stepMatch(1)
@@ -776,45 +870,54 @@ class CsvTab(QWidget):
         s = self.search
         if not s:
             return self.startSearch()
-        if not len(s.hits):
-            return
-        cur = self.table.currentIndex()
-        col = self.matchColumn()
-        if self.model.rowMap is not None:
-            row = (self.model.virtualRow(cur.row()) + step) if cur.isValid() else 0
-            return self.jumpTo(row % len(s.hits), col)
-        here = self.model.dataRow(cur.row()) if cur.isValid() else -1
-        if step > 0:
-            i = bisect_right(s.hits, here)
-            self.jumpTo(s.hits[i] if i < len(s.hits) else s.hits[0], col)
-        else:
-            i = bisect_left(s.hits, here) - 1
-            self.jumpTo(s.hits[i] if i >= 0 else s.hits[-1], col)
+        hit = self.nextHit(self.currentDataRow(), step)
+        if hit is not None:
+            self.jumpTo(self.virtualOf(hit), self.matchColumn())
 
     def exportMatches(self):
         s = self.search
-        if not s or not len(s.hits):
-            QMessageBox.information(self, 'Export', 'Run a search first; its matching rows are what gets exported.')
-            return
-        if not s.done:
-            QMessageBox.information(self, 'Export', 'Wait for the search to finish.')
+        if self.filterScan:
+            # With column filters, the rows on screen are what gets exported
+            if not self.filterScan.done or self.mapPending:
+                QMessageBox.information(self, 'Export', 'Wait for the filter to finish.')
+                return
+            rows, title, suffix = self.model.rowMap, 'Export filtered rows', 'filtered'
+        else:
+            if not s or not len(s.hits):
+                QMessageBox.information(self, 'Export', 'Run a search or set a column filter first; '
+                                                        'its rows are what gets exported.')
+                return
+            if not s.done:
+                QMessageBox.information(self, 'Export', 'Wait for the search to finish.')
+                return
+            rows, title, suffix = s.hits, 'Export matching rows', 'matches'
+        if not len(rows):
+            QMessageBox.information(self, 'Export', 'No rows to export.')
             return
         base = os.path.splitext(self.index.path)[0]
-        path, _ = QFileDialog.getSaveFileName(self, 'Export matching rows', f'{base}_matches.csv', 'CSV (*.csv)')
+        path, _ = QFileDialog.getSaveFileName(self, title, f'{base}_{suffix}.csv', 'CSV (*.csv)')
         if path:
             if samePath(path, self.index.path):
                 QMessageBox.warning(self, 'Export', 'Choose a different file than the one being viewed.')
                 return
-            self.export = Export(self.index, s.hits, path).start()
+            self.export = Export(self.index, rows, path).start()
 
     # ---------- columns ----------
 
-    def headerMenu(self, pos):
+    def headerMenu(self, pos, header):
         if not self.index:
             return
-        col = self.table.horizontalHeader().logicalIndexAt(pos)
+        col = header.logicalIndexAt(pos)
         menu = QMenu(self)
         if col >= 0:
+            if col in self.filters:
+                menu.addAction('Open filter…', lambda: self.openFilter(header, col))
+                menu.addAction('Remove filter dropdown', lambda: self.removeColumnFilter(col))
+            else:
+                menu.addAction('Add filter dropdown', lambda: self.addColumnFilter(col, header))
+            if any(self.filters.values()):
+                menu.addAction('Clear all filters', self.clearFilters)
+            menu.addSeparator()
             menu.addAction(f'Hide "{self.model.columns[col]}"', lambda: self.table.setColumnHidden(col, True))
             menu.addAction('Freeze columns up to here', lambda: self.freezeSpin.setValue(col + 1))
             menu.addAction('Search in this column', lambda: (self.columnBox.setCurrentIndex(col + 1), self.focusSearch()))
@@ -828,7 +931,7 @@ class CsvTab(QWidget):
         menu.addSeparator()
         menu.addAction('Columns…', self.columnsDialog)
         menu.addAction('Show all columns', self.showAllColumns)
-        menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
+        menu.exec(header.mapToGlobal(pos))
 
     def toQuery(self, method, path, column):
         # Same as dragging the header into the Query panel
@@ -858,9 +961,147 @@ class CsvTab(QWidget):
         last = min(self.model.rowCount() - 1, first + 60) if last < 0 else last
         for c in cols if cols is not None else range(self.model.columnCount()):
             texts = [self.model.columns[c]] + [self.model.data(self.model.index(r, c)) or '' for r in range(first, last + 1)]
-            width = max(fm.horizontalAdvance(t) for t in texts) + 24
+            width = max(fm.horizontalAdvance(t) for t in texts) + 24 + (FILTER_BUTTON if c in self.filters else 0)
             self.table.setColumnWidth(c, max(50, min(width, 420)))
         self.table.refreshFrozen()
+
+    # ---------- column filters ----------
+
+    def filterKey(self, filters):
+        return tuple(sorted((c, spec) for c, spec in filters.items() if spec))
+
+    def valueScan(self, col):
+        """Counts of a column's values among the rows the other filters keep; cached per filter combination."""
+        others = {c: spec for c, spec in self.filters.items() if spec and c != col}
+        key = (col, self.filterKey(others))
+        scan = self.valueScans.get(key)
+        if scan is None or (scan.cancelled and not scan.done):
+            scan = self.valueScans[key] = ColumnScan(self.index, others, count=col).start()
+        return scan
+
+    def addColumnFilter(self, col, header=None):
+        if col not in self.filters:
+            self.makeRoomForButton(col)
+            self.filters[col] = None
+            self.syncFilterHeaders()
+        self.openFilter(header or self.headerFor(col), col)
+
+    def headerFor(self, col):
+        frozen = col < self.table.frozenCount
+        return (self.table.frozen if frozen else self.table).horizontalHeader()
+
+    def openFilter(self, header, col):
+        if not self.index:
+            return
+        if not self.index.done:
+            self.window.statusBar().showMessage('Filters work once indexing has finished', 5000)
+            return
+        if col not in self.filters:
+            return self.addColumnFilter(col, header)
+        if header is self.table.horizontalHeader() and header.sectionViewportPosition(col) < 0:
+            self.table.scrollTo(self.model.index(max(0, self.table.rowAt(0)), col))
+        FilterPopup(self, col).showUnder(header, col)
+
+    def filterCurrentColumn(self):
+        cur = self.table.currentIndex()
+        if self.index and self.model.columnCount():
+            self.addColumnFilter(cur.column() if cur.isValid() else 0)
+
+    def makeRoomForButton(self, col):
+        # Room for the ▾ button next to the column name
+        need = self.table.fontMetrics().horizontalAdvance(self.model.columns[col]) + 24 + FILTER_BUTTON
+        if self.table.columnWidth(col) < need:
+            self.table.setColumnWidth(col, min(need, 420))
+            self.table.refreshFrozen()
+
+    def setColumnFilter(self, col, spec):
+        if col not in self.filters:
+            self.makeRoomForButton(col)
+        self.filters[col] = spec
+        self.restartFilter()
+
+    def removeColumnFilter(self, col):
+        self.filters.pop(col, None)
+        self.restartFilter()
+
+    def clearFilters(self):
+        self.filters = dict.fromkeys(self.filters)
+        self.restartFilter()
+
+    def syncFilterHeaders(self):
+        self.model.filterCols = {c: bool(spec) for c, spec in self.filters.items()}
+        for view in (self.table, self.table.frozen):
+            view.horizontalHeader().viewport().update()
+
+    def stopFilterScans(self):
+        if self.filterScan:
+            self.filterScan.cancel()
+        for scan in self.valueScans.values():
+            scan.cancel()
+        # Finished counts stay valid for their filter combination; unfinished ones restart when needed
+        self.valueScans = {k: v for k, v in self.valueScans.items() if v.done}
+
+    def restartFilter(self):
+        self.stopFilterScans()
+        self.syncFilterHeaders()
+        active = {c: spec for c, spec in self.filters.items() if spec}
+        self.filterScan = ColumnScan(self.index, active).start() if active and self.index else None
+        self.filterRows = None
+        self.applyFilter()
+        self.updateFilterStatus()
+
+    def resetFilters(self):
+        self.stopFilterScans()
+        self.valueScans = {}
+        self.filters = {}
+        self.filterScan = None
+        self.filterRows = None
+        self.mapPending = False
+        self.syncFilterHeaders()
+        self.updateFilterStatus()
+
+    def updateFilterStatus(self):
+        fs = self.filterScan
+        if fs and fs.done and self.filterRows is None:
+            self.filterRows = np.frombuffer(fs.hits, np.int64) if len(fs.hits) else np.zeros(0, np.int64)
+        if self.mapPending and self.filterRows is not None and self.search and self.search.done:
+            self.applyFilter()
+        self.filterLabel.setVisible(fs is not None)
+        self.clearFiltersBtn.setVisible(fs is not None)
+        if fs and self.index:
+            n = sum(1 for spec in self.filters.values() if spec)
+            busy = '' if fs.done else f'  ·  filtering {fs.progress:.0%}'
+            self.filterLabel.setText(f'Filtered ({n} column{"s" if n != 1 else ""}): {len(fs.hits):,} of '
+                                     f'{self.index.dataRows:,} rows{busy}')
+
+    def cellMenu(self, view, pos):
+        idx = view.indexAt(pos)
+        if not self.index or not idx.isValid():
+            return
+        col = idx.column()
+        value = self.model.cell(idx.row(), col)
+        raw = value.encode(self.index.encoding, 'replace')
+        shown = (value[:40] + '…' if len(value) > 40 else value).replace('\n', ' ') or '(Blanks)'
+        spec = self.filters.get(col)
+        menu = QMenu(self)
+        menu.addAction('Copy', self.copySelection)
+        menu.addAction('Copy with header', lambda: self.copySelection(withHeader=True))
+        menu.addSeparator()
+        menu.addAction(f'Filter to "{shown}"', lambda: self.setFilterFromCell(col, ('in', frozenset([raw]))))
+        if spec and spec[0] == 'in':
+            excluded = ('in', spec[1] - {raw})
+        else:
+            excluded = ('out', (spec[1] if spec and spec[0] == 'out' else frozenset()) | {raw})
+        menu.addAction(f'Hide rows with "{shown}"', lambda: self.setFilterFromCell(col, excluded))
+        if spec:
+            menu.addAction(f'Clear filter on "{self.model.columns[col]}"', lambda: self.setColumnFilter(col, None))
+        menu.exec(view.viewport().mapToGlobal(pos))
+
+    def setFilterFromCell(self, col, spec):
+        if not self.index.done:
+            self.window.statusBar().showMessage('Filters work once indexing has finished', 5000)
+            return
+        self.setColumnFilter(col, spec)
 
     # ---------- clipboard ----------
 
@@ -975,7 +1216,7 @@ class MainWindow(QMainWindow):
         self.act(file, '&Open in new tab…', self.openDialog, [QKeySequence.StandardKey.Open, QKeySequence('Ctrl+T')])
         self.act(file, 'Reopen with &options…', lambda: self.onTab('reopenWithOptions'), 'Ctrl+Shift+O')
         file.addSeparator()
-        self.act(file, '&Export matching rows…', lambda: self.onTab('exportMatches'), 'Ctrl+E')
+        self.act(file, '&Export matching / filtered rows…', lambda: self.onTab('exportMatches'), 'Ctrl+E')
         file.addSeparator()
         self.act(file, '&Close tab', lambda: self.closeTab(self.tabs.currentIndex()), QKeySequence('Ctrl+W'))
         self.act(file, 'Close &other tabs', lambda: self.closeOthers(self.tabs.currentIndex()))
@@ -989,6 +1230,9 @@ class MainWindow(QMainWindow):
         self.act(edit, 'Find &next', lambda: self.onTab('nextMatch'), 'F3')
         self.act(edit, 'Find &previous', lambda: self.onTab('prevMatch'), 'Shift+F3')
         self.act(edit, '&Go to row…', lambda: self.onTab('gotoRow'), 'Ctrl+G')
+        edit.addSeparator()
+        self.act(edit, 'F&ilter this column…', lambda: self.onTab('filterCurrentColumn'), 'Ctrl+Shift+F')
+        self.act(edit, 'C&lear all filters', lambda: self.onTab('clearFilters'))
         view = self.menuBar().addMenu('&View')
         explorerAct = self.explorerDock.toggleViewAction()
         explorerAct.setText('&Explorer panel')

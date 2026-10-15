@@ -7,7 +7,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from csvviewer.index import CsvIndex, Search, Export  # noqa: E402
+from csvviewer.index import ColumnScan, CsvIndex, Search, Export  # noqa: E402
 
 
 def write(tmp, name, data):
@@ -86,6 +86,38 @@ def main():
     assert exported[0] == ['id', 'name', 'note', 'value']
     assert exported[1:] == [rows[i] for i in s.hits]
     idx.close()
+
+    # Column filters: values and hits agree with the csv module, also on quoted, short and CRLF rows
+    allQuoted = io.StringIO(newline='')
+    csv.writer(allQuoted, quoting=csv.QUOTE_ALL).writerows(expectedRows(data)[:2000])
+    odd = b'a,b,c\n"abc"def,x,1\n1,"p""q",2\n"",""""\n2,"a,b"c,3\n'
+    for name, data, block, kw in [('search.csv', data, 16, {}), ('crlf.csv', b'a,b\r\n1,x\r\n2,"y,z"\r\n3\r\n\r\n4,x', 2, {}),
+                                  ('quoted.csv', allQuoted.getvalue().encode(), 8, {}), ('odd.csv', odd, 2, {}),
+                                  ('unaware.csv', b'a,b,c\n"x,y",2,3\n4,"5",6\n', 1, {'quoteAware': False})]:
+        path = write(tmp, 'f_' + name, data)
+        idx = CsvIndex(path, block=block, **kw)
+        idx.build()
+        rows = expectedRows(data)[1:]
+        cell = lambda r, c: (r[c] if c < len(r) else '').encode()
+        for c in range(len(rows[0])):
+            scan = ColumnScan(idx, {}, count=c)
+            scan.run()
+            want = {}
+            for r in rows:
+                want[cell(r, c)] = want.get(cell(r, c), 0) + 1
+            assert scan.values == want, (name, c)
+        pick = sorted({cell(r, 1) for r in rows})[:3]
+        for filters, test in [({1: ('in', set(pick))}, lambda r: cell(r, 1) in pick),
+                              ({1: ('out', set(pick))}, lambda r: cell(r, 1) not in pick),
+                              ({0: ('contains', b'1'), 1: ('out', {b'x'})}, lambda r: b'1' in cell(r, 0) and cell(r, 1) != b'x')]:
+            scan = ColumnScan(idx, filters)
+            scan.run()
+            assert list(scan.hits) == [i for i, r in enumerate(rows) if test(r)], (name, filters)
+        # Counting one column ignores that column's own filter but keeps the others
+        scan = ColumnScan(idx, {1: ('in', set(pick)), 0: ('contains', b'1')}, count=1)
+        scan.run()
+        assert sum(scan.values.values()) == sum(1 for r in rows if b'1' in cell(r, 0)), name
+        idx.close()
     print('all index tests passed')
 
 
