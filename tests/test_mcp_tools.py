@@ -74,7 +74,7 @@ def checkDefinitions(tools):
     assert json.dumps(defs) == json.dumps(tools.definitions())
     want = {'get_app_state', 'open_file', 'close_tab', 'switch_tab', 'list_tabs', 'describe_tab', 'get_rows', 'search_rows',
             'run_sql', 'go_to_row', 'set_search', 'clear_search', 'set_frozen_columns', 'set_column_visibility',
-            'show_all_columns', 'export_matches', 'get_selection', 'set_theme', 'reopen_tab'}
+            'show_all_columns', 'export_matches', 'get_selection', 'set_theme', 'reopen_tab', 'show_query'}
     assert set(names) == want, set(names) ^ want
     for d in defs:
         assert not any(w in d['name'] for w in ('ask', 'assistant', 'chat')), d['name']
@@ -151,6 +151,27 @@ def run(tools, window, steps):
     assert sum(r[2] for r in sql['rows']) == sum(int(r[5]) for r in rows)
     assert s.ok('run_sql', query='SELECT count(*) FROM t2')['rows'] == [[300]]
     s.bad('run_sql', 'read-only', query='DROP TABLE t1')
+    # Table names work in run_sql too, and get_app_state / list_tabs show them
+    assert [t['table'] for t in s.state()['tabs']] == ['data', 'other']
+    assert [t['table'] for t in s.ok('list_tabs')['tabs']] == ['data', 'other']
+    assert s.ok('run_sql', query='SELECT count(*) FROM Other')['rows'] == [[300]]
+
+    # show_query: the SQL goes into the Query panel (t1 becomes the table name) and runs there
+    shown = s.ok('show_query', query="SELECT city, count(*) AS n FROM t1 WHERE note <> 't1' GROUP BY 1 ORDER BY 1")
+    assert shown['sql'] == "SELECT city, count(*) AS n FROM data WHERE note <> 't1' GROUP BY 1 ORDER BY 1", shown
+    assert shown['tabId'] == 1 and shown['table'] == 'data' and not shown['error'] and shown['columns'] == ['city', 'n']
+    assert {r[0]: r[1] for r in shown['rows']} == dict(Counter(r[2] for r in rows if r[3])), shown  # empty notes are NULL
+    panel = window.queryPanel
+    assert tools.gui(lambda: (panel.editSql.isChecked(), panel.sqlBox.toPlainText(), panel.fileBox.currentText(),
+                        window.sideDock.isVisible(), len(panel.model.rows))) == (True, shown['sql'], 'data', True, 5)
+    # The first table mentioned picks the panel; errors come back; run=false only fills the box
+    other2 = s.ok('show_query', query='SELECT count(*) FROM T2_text')
+    assert other2['tabId'] == 2 and other2['sql'] == 'SELECT count(*) FROM other_text' and other2['rows'] == [[300]]
+    failed = s.ok('show_query', query='SELECT nope FROM t1')
+    assert failed['tabId'] == 1 and 'nope' in failed['error'] and 'rows' not in failed
+    assert s.ok('show_query', query='SELECT 1 AS x', tabId=2, run=False)['status'] == 'shown'
+    assert tools.gui(lambda: panel.sqlBox.toPlainText()) == 'SELECT 1 AS x'
+    assert 'read-only' in s.ok('show_query', query='DROP VIEW t1')['error']
 
     # go_to_row moves the current cell
     moved = s.ok('go_to_row', tabId=1, row=1234, column='city')

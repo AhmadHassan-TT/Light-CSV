@@ -1,4 +1,5 @@
 """Snapshots of the open tabs, taken on the GUI thread so tools never touch Qt widgets from the worker."""
+import os
 from dataclasses import dataclass, field
 
 
@@ -13,6 +14,7 @@ class TabInfo:
     current: bool = False  # the tab the user is looking at
     searchTerm: str = ''  # the tab's active search, if any
     searchHits: int = 0
+    table: str = ''  # the tab's SQL table name (stable while tabs move); '' = t<tabId>
 
 
 def snapshotTabs(window):
@@ -25,7 +27,8 @@ def snapshotTabs(window):
             continue
         search = tab.search
         tabs.append(TabInfo(
-            tabId=i + 1, name=window.tabs.tabText(i).split(' (')[0], path=tab.index.path, index=tab.index,
+            tabId=i + 1, name=os.path.basename(tab.index.path), path=tab.index.path, index=tab.index,
             columns=list(tab.model.columns), indexed=tab.index.done, current=tab is current,
-            searchTerm=tab.lastQuery[0] if tab.lastQuery else '', searchHits=len(search.hits) if search else 0))
+            searchTerm=tab.lastQuery[0] if tab.lastQuery else '', searchHits=len(search.hits) if search else 0,
+            table=getattr(tab, 'tableName', '')))
     return tabs

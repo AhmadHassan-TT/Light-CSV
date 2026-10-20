@@ -14,6 +14,7 @@ INDEX_CHUNK = 64 << 20  # bytes scanned per indexing step
 SEARCH_CHUNK = 4 << 20  # bytes scanned per search step (small so the UI stays responsive)
 FILTER_CHUNK = 16 << 20  # bytes per column-filter step
 MAX_DISTINCT = 50_000  # a filter list stops collecting new values past this
+MAX_STATS_DISTINCT = 2_000_000  # column statistics stop telling new values apart past this
 CACHE_BLOCKS = 512
 NL, CR, QUOTE = 10, 13, 34
 
@@ -291,9 +292,11 @@ class Search:
 class ColumnScan:
     """Tests column filters on every row in a background thread, like Excel's AutoFilter.
 
-    filters: {col: (mode, values)} with mode 'in' / 'out' (a set of raw cell bytes) or 'contains' (lower-case bytes).
-    Without `count`, hits are the matching data rows in file order. With `count=col`, it counts that column's values
-    among the rows the other filters keep; `values` is a {bytes: rows} snapshot that grows while scanning.
+    filters: {col: (mode, values)} with mode 'in' / 'out' (a set of raw cell bytes), 'contains' (lower-case bytes),
+    'first' (only the first row of each value: unique rows) or 'dups' (only rows whose value shows up more than once
+    among the rows the value filters keep); the last two take None for values. Without `count`, hits are the matching
+    data rows in file order. With `count=col`, it counts that column's values among the rows the other filters keep;
+    `values` is a {bytes: rows} snapshot that grows while scanning.
     """
 
     def __init__(self, index, filters, count=None):
@@ -302,6 +305,7 @@ class ColumnScan:
         self.count = count
         self.hits = array('q')
         self.values = {}
+        self.counter = Counter()
         self.capped = False
         self.progress = 0.0
         self.done = False
@@ -321,15 +325,17 @@ class ColumnScan:
         self.progress = 1.0
         self.done = True
 
-    def scan(self, f):
+    def wanted(self):
+        """Columns besides the filtered ones that each chunk needs."""
+        return {self.count} if self.count is not None else set()
+
+    def chunks(self, f, cols, lo=0.0, hi=1.0):
+        """(firstRow, nRows, fields) for each run of whole data rows; progress moves from lo to hi."""
         idx = self.index
         total, block = idx.rowsIndexed, idx.block
-        offsetRow = 1 if idx.hasHeader else 0
         nBlocks = len(idx.blockStarts)
         avg = max(1, (idx.indexedEnd - idx.start) // max(1, total))
         step = max(1, FILTER_CHUNK // (avg * block))
-        cols = sorted(set(self.filters) | ({self.count} if self.count is not None else set()))
-        counts = Counter()
         for b in range(0, nBlocks, step):
             if self.cancelled:
                 return
@@ -341,30 +347,72 @@ class ColumnScan:
             if nRows <= 0:
                 break
             f.seek(start)
-            fields = self.fields(f.read(end - start), nRows, cols)
-            keep = np.ones(nRows, bool)
-            keep[:max(0, offsetRow - firstRow)] = False
-            for c, (mode, values) in self.filters.items():
-                vals = fields[c]
-                if mode == 'contains':
-                    ok = (values in v.lower() for v in vals)
-                elif mode == 'in':
-                    ok = (v in values for v in vals)
-                else:
-                    ok = (v not in values for v in vals)
-                keep &= np.fromiter(ok, bool, nRows)
-            rows = np.flatnonzero(keep)
-            if self.count is None:
-                self.hits.frombytes((rows + (firstRow - offsetRow)).astype(np.int64).tobytes())
+            yield firstRow, nRows, self.fields(f.read(end - start), nRows, cols)
+            self.progress = lo + (hi - lo) * min(1.0, (end - idx.start) / max(1, idx.indexedEnd - idx.start))
+
+    def keepValues(self, filters, firstRow, nRows, fields):
+        # Rows the in / out / contains filters keep (the header row never)
+        keep = np.ones(nRows, bool)
+        keep[:max(0, (1 if self.index.hasHeader else 0) - firstRow)] = False
+        for c, (mode, values) in filters.items():
+            vals = fields[c]
+            if mode == 'contains':
+                ok = (values in v.lower() for v in vals)
+            elif mode == 'in':
+                ok = (v in values for v in vals)
             else:
-                vals = fields[self.count]
-                counts.update(vals if len(rows) == nRows else [vals[i] for i in rows.tolist()])
-                if len(counts) > MAX_DISTINCT:
-                    self.values = dict(islice(counts.items(), MAX_DISTINCT))
-                    self.capped = True
-                    return
-                self.values = dict(counts)
-            self.progress = min(1.0, (end - idx.start) / max(1, idx.indexedEnd - idx.start))
+                ok = (v not in values for v in vals)
+            keep &= np.fromiter(ok, bool, nRows)
+        return keep
+
+    def scan(self, f):
+        plain = {c: spec for c, spec in self.filters.items() if spec[0] not in ('first', 'dups')}
+        dups = [c for c, spec in self.filters.items() if spec[0] == 'dups']
+        first = [c for c, spec in self.filters.items() if spec[0] == 'first']
+        cols = sorted(set(self.filters) | self.wanted())
+        repeated = {}
+        if dups:
+            # First pass: which values show up more than once
+            counts = {c: Counter() for c in dups}
+            for firstRow, nRows, fields in self.chunks(f, sorted(set(plain) | set(dups)), 0.0, 0.5):
+                rows = np.flatnonzero(self.keepValues(plain, firstRow, nRows, fields)).tolist()
+                for c in dups:
+                    vals = fields[c]
+                    counts[c].update(vals if len(rows) == nRows else [vals[i] for i in rows])
+            if self.cancelled:
+                return
+            repeated = {c: {v for v, n in counts[c].items() if n > 1} for c in dups}
+            del counts
+        seen = {c: set() for c in first}
+        for firstRow, nRows, fields in self.chunks(f, cols, 0.5 if dups else 0.0, 1.0):
+            keep = self.keepValues(plain, firstRow, nRows, fields)
+            for c in dups:
+                values = repeated[c]
+                keep &= np.fromiter((v in values for v in fields[c]), bool, nRows)
+            for c in first:
+                values, vals = seen[c], fields[c]
+                for i in np.flatnonzero(keep).tolist():
+                    if vals[i] in values:
+                        keep[i] = False
+                    else:
+                        values.add(vals[i])
+            if not self.take(firstRow, nRows, fields, np.flatnonzero(keep)):
+                return
+
+    def take(self, firstRow, nRows, fields, rows):
+        """Use the kept rows (indexes into the chunk) of one chunk; False stops the scan."""
+        if self.count is None:
+            self.hits.frombytes((rows + (firstRow - (1 if self.index.hasHeader else 0))).astype(np.int64).tobytes())
+            return True
+        counts = self.counter
+        vals = fields[self.count]
+        counts.update(vals if len(rows) == nRows else [vals[i] for i in rows.tolist()])
+        if len(counts) > MAX_DISTINCT:
+            self.values = dict(islice(counts.items(), MAX_DISTINCT))
+            self.capped = True
+            return False
+        self.values = dict(counts)
+        return True
 
     def fields(self, data, nRows, cols):
         """{col: [raw cell bytes per row]} for a run of whole rows, as the csv parser would read them."""
@@ -416,6 +464,52 @@ class ColumnScan:
         return out
 
 
+class ColumnStats(ColumnScan):
+    """Counts for one column over the rows the filters keep (the rows on screen): rows, blanks, distinct and repeated values, and
+    sum / min / max of the cells that are numbers. Past MAX_STATS_DISTINCT different values, new ones are no
+    longer told apart (capped), so distinct counts become "at least"."""
+
+    def __init__(self, index, filters, col):
+        super().__init__(index, filters)
+        self.col = col
+        self.rows = self.blanks = self.numbers = 0
+        self.total = 0.0
+        self.low = self.high = None
+
+    def wanted(self):
+        return {self.col}
+
+    def take(self, firstRow, nRows, fields, rows):
+        vals = fields[self.col]
+        vals = vals if len(rows) == nRows else [vals[i] for i in rows.tolist()]
+        self.rows += len(vals)
+        counts = self.counter
+        if self.capped:
+            counts.update(v for v in vals if v in counts)
+        else:
+            counts.update(vals)
+            self.capped = len(counts) >= MAX_STATS_DISTINCT
+        for v in vals:
+            if not v.strip():
+                self.blanks += 1
+                continue
+            try:
+                x = float(v)
+            except ValueError:
+                continue
+            if x != x or x in (float('inf'), float('-inf')):
+                continue
+            self.numbers += 1
+            self.total += x
+            self.low = x if self.low is None or x < self.low else self.low
+            self.high = x if self.high is None or x > self.high else self.high
+        return True
+
+    def top(self, n=200):
+        """[(value, rows)], most rows first."""
+        return self.counter.most_common(n)
+
+
 class Export:
     """Writes the header plus the given data rows, byte for byte, to a new file."""
 
@@ -447,5 +541,45 @@ class Export:
                         self.progress = n / total
         except OSError as e:
             self.error = str(e)
+        self.progress = 1.0
+        self.done = True
+
+
+class FileCopy:
+    """Copies a file in the background through a .part file, so a stopped or failed copy leaves nothing behind."""
+
+    def __init__(self, source, path):
+        self.source, self.path = source, path
+        self.progress = 0.0
+        self.done = False
+        self.cancelled = False
+        self.error = None
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def run(self):
+        tmp = self.path + '.part'
+        try:
+            total = max(1, os.path.getsize(self.source))
+            copied = 0
+            with open(self.source, 'rb') as src, open(tmp, 'wb') as out:
+                while not self.cancelled:
+                    chunk = src.read(SEARCH_CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    copied += len(chunk)
+                    self.progress = copied / total
+            if self.cancelled:
+                os.remove(tmp)
+            else:
+                os.replace(tmp, self.path)
+        except OSError as e:
+            self.error = str(e)
+            if os.path.exists(tmp):
+                os.remove(tmp)
         self.progress = 1.0
         self.done = True

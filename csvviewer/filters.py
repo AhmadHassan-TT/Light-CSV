@@ -9,6 +9,8 @@ from .index import MAX_DISTINCT
 
 MAX_LABEL = 200
 BLANKS = '(Blanks)'
+MODE_NOTE = {'first': 'Showing unique rows: the first row of each value. Untick values to filter by value instead.',
+             'dups': 'Showing only values that appear more than once. Untick values to filter by value instead.'}
 
 
 def sortKey(byCount, counts):
@@ -75,6 +77,10 @@ class FilterPopup(QFrame):
         buttons.addWidget(cancelBtn)
         layout = QVBoxLayout(self)
         layout.addWidget(title)
+        if self.spec and self.spec[0] in MODE_NOTE:
+            note = QLabel(MODE_NOTE[self.spec[0]])
+            note.setWordWrap(True)
+            layout.addWidget(note)
         layout.addLayout(top)
         layout.addWidget(self.allBox)
         layout.addWidget(self.list, 1)
@@ -103,7 +109,7 @@ class FilterPopup(QFrame):
 
     def initiallyChecked(self, value):
         spec = self.spec
-        if not spec or spec[0] == 'contains':
+        if not spec or spec[0] in ('contains', 'first', 'dups'):
             return True
         return value in spec[1] if spec[0] == 'in' else value not in spec[1]
 
@@ -201,7 +207,8 @@ class FilterPopup(QFrame):
         checked = frozenset(v for v in values if self.isChecked(v))
         unchecked = frozenset(values) - checked
         if not unchecked:
-            return None
+            # Every value ticked keeps a unique / duplicates filter; unticking values replaces it
+            return self.spec if self.spec and self.spec[0] in MODE_NOTE else None
         # Values the scan has not reached (still reading, or past the cap) stay visible
         if self.scan.capped or not self.scan.done or len(unchecked) <= len(checked):
             return ('out', unchecked)

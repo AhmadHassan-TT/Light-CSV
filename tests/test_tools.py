@@ -69,7 +69,8 @@ def main():
 
     # Definitions are deterministic and strict
     defs = tools.definitions()
-    assert [d['name'] for d in defs] == ['list_tabs', 'describe_tab', 'get_rows', 'search_rows', 'run_sql', 'show_rows']
+    assert [d['name'] for d in defs] == ['list_tabs', 'describe_tab', 'get_rows', 'search_rows', 'run_sql', 'show_query',
+                                         'show_rows']
     assert json.dumps(defs) == json.dumps(CsvTools([]).definitions())
     for d in defs:
         assert d['strict'] and d['input_schema']['additionalProperties'] is False and 'required' in d['input_schema']
@@ -102,6 +103,21 @@ def main():
     expectError(tools, 'show_rows', 'out of range', tabId=1, row=n + 5)
     expectError(tools, 'nope', 'unknown tool')
     expectError(tools, 'get_rows', 'bad input', tabId=1)
+
+    # show_query hands the query to the window (its Query panel) for the tab it mentions
+    two = CsvTools([tab, TabInfo(tabId=2, name='b.csv', path=path, index=tab.index, columns=HEADER, table='sales')])
+    text, action = two.run('show_query', {'query': 'SELECT count(*) FROM T2'})
+    assert action == {'type': 'showQuery', 'tabId': 2, 'query': 'SELECT count(*) FROM T2'} and 'Query panel' in text
+    assert two.run('show_query', {'query': 'SELECT * FROM sales_text'})[1]['tabId'] == 2  # by table name
+    assert two.run('show_query', {'query': 'SELECT 1'})[1]['tabId'] == 1  # the current tab
+    assert two.run('show_query', {'query': 'SELECT 1', 'tabId': 2})[1]['tabId'] == 2
+    expectError(two, 'show_query', 'no tab 5', query='SELECT 1', tabId=5)
+    expectError(two, 'show_query', 'empty', query='  ')
+    # A table name works in run_sql like its t<N> view, and list_tabs shows it
+    res, _ = call(two, 'run_sql', query='SELECT count(*) FROM SALES')
+    assert res['rows'] == [[n]], res
+    assert [t.get('table') for t in call(two, 'list_tabs')[0]] == [None, 'sales']
+    two.close()
 
     # search_rows against Python truth
     res, _ = call(tools, 'search_rows', tabId=1, text='multi\nline')

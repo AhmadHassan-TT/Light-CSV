@@ -21,6 +21,7 @@ MAX_VALUE = 500
 MAX_SELECTION = 2000
 FIRST_MATCHES = 20
 DELEGATED = ('list_tabs', 'describe_tab', 'get_rows', 'search_rows', 'run_sql')
+PANEL_ROWS = 20  # result rows show_query returns (the panel shows up to its limit)
 DELIMITER_NAMES = {'comma': ',', 'semicolon': ';', 'tab': '\t', 'pipe': '|', '\\t': '\t'}
 
 
@@ -86,6 +87,18 @@ DEFINITIONS = [
     delegated('search_rows', 'Search rows (no UI change)',
               ' Does not touch the tab\'s search bar; use set_search to drive the viewer\'s own search.'),
     delegated('run_sql', 'Run SQL'),
+    tool('show_query', 'Show and run SQL in the Query panel',
+         "Put a read-only DuckDB query into the viewer's Query panel (Edit SQL mode) and run it there, so the user "
+         'sees it, its full result table, and can change, export or save it. Use it when the user asks to see, '
+         'build or run a query in the app; use run_sql for answers you only need yourself. Tables are the views '
+         'of run_sql: t{tabId} (or t{tabId}_text), which are turned into the tab\'s table name as shown in the '
+         "panel (list_tabs 'table'); the table names work directly too. The query belongs to one tab's panel: "
+         'tabId, else the first table the query mentions, else the shown tab. With wait (default true) returns the '
+         f'panel status, any error, the column names and the first {PANEL_ROWS} rows.',
+         {'query': {'type': 'string', 'minLength': 1, 'description': 'One read-only SQL statement.'}, 'tabId': TAB_ID,
+          'run': {'type': 'boolean', 'description': 'Run it (default true); false only fills the SQL box.'},
+          'wait': {'type': 'boolean', 'description': 'Wait for the result (default true, up to 10 min).'}},
+         ['query']),
     tool('go_to_row', 'Go to row',
          'Show a tab, select a data row (and column) and scroll to it. Turns off "Only matches" first if it is on.',
          {'tabId': TAB_ID, 'row': ROW, 'column': COLUMN}, ['tabId', 'row'], idempotent=True),
@@ -287,7 +300,7 @@ class McpTools(QObject):
             return {'tabId': i + 1, 'name': self.window.tabs.tabText(i), 'path': None, 'empty': True}
         tab.tick()
         cols = tab.model.columns
-        return {'tabId': i + 1, 'name': os.path.basename(idx.path), 'path': idx.path, 'sizeBytes': idx.size,
+        return {'tabId': i + 1, 'name': os.path.basename(idx.path), 'table': tab.tableName, 'path': idx.path, 'sizeBytes': idx.size,
                 'rows': idx.dataRows, 'columns': len(cols), 'indexed': idx.done, 'progress': round(idx.progress, 4),
                 'current': tab is self.window.current(), 'delimiter': idx.delimiter, 'encoding': idx.encoding,
                 'hasHeader': idx.hasHeader, 'quoteAware': idx.quoteAware, 'frozenColumns': tab.table.frozenCount,
@@ -418,6 +431,49 @@ class McpTools(QObject):
                 raise McpError(f'could not reopen {index.path}')
             return self.tabInfo(self.tabIdOf(tab) - 1)
         return self.gui(reopen, SLOW_GUI_TIMEOUT)
+
+    def tool_show_query(self, query, tabId=None, run=True, wait=True):
+        from csvviewer import sqlviews
+
+        def start():
+            panel = self.window.queryPanel
+            if not panel.available:
+                raise McpError('the Query panel needs the duckdb package')
+            if panel.busy:
+                raise McpError('the Query panel is busy with another query or export; try again when it is done')
+            tabs = [self.window.tabs.widget(i) for i in range(self.window.tabs.count())]
+            names = {f't{i + 1}': t.tableName for i, t in enumerate(tabs) if t.index and t.tableName}
+            sql = sqlviews.renameRefs(query, names)
+            if tabId is not None:
+                tab = self.tabAt(tabId)
+            else:
+                refs = sqlviews.tableRefs(sql, [t.tableName for t in tabs if t.index and t.tableName])
+                tab = next((t for t in tabs if refs and t.index and t.tableName == refs[0][0]), self.window.current())
+            if not tab or not tab.index:
+                raise McpError('no file is open')
+            ticket = panel.showQuery(sql, tab.index.path, run)
+            if ticket is None:
+                raise McpError('the Query panel could not take the query')
+            return panel, ticket, tab, sql
+        panel, ticket, tab, sql = self.gui(start, SLOW_GUI_TIMEOUT)
+        out = {'table': tab.tableName, 'sql': sql}
+        if not run or not wait:
+            out['tabId'] = self.gui(lambda: self.tabIdOf(tab))
+            out['status'] = 'shown' if not run else 'running in the Query panel'
+            return out
+        if not self.waitFor(lambda: ticket in panel.finished):
+            out['status'] = f'still running after {WAIT_TIMEOUT} s; it keeps running in the Query panel'
+            return out
+
+        def outcome():
+            done = panel.finished.pop(ticket)
+            res = done['result']
+            out.update(tabId=self.tabIdOf(tab), status=done['status'], error=done['error'] or None)
+            if res:
+                out.update(columns=res['columns'], rows=[[clip(v) for v in r] for r in res['rows'][:PANEL_ROWS]],
+                           rowsShown=len(res['rows']), more=res['more'])
+            return out
+        return self.gui(outcome)
 
     def tool_go_to_row(self, tabId, row, column=None):
         def go():

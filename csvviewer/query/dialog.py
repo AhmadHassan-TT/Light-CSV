@@ -3,6 +3,7 @@ worker pool; table column headers can be dropped onto it (mime COLUMN_MIME) to f
 import importlib.util
 import json
 import os
+import re
 import time
 
 from PyQt6.QtCore import (QAbstractTableModel, QEvent, QModelIndex, QObject, QPoint, QStandardPaths, Qt, QTimer,
@@ -16,17 +17,20 @@ from PyQt6.QtWidgets import (
 
 from . import builder
 from .builder import BuilderError
+from .engine import tableOf
 
 Role = QPalette.ColorRole
 COLUMN_MIME = 'application/x-lightcsv-column'  # UTF-8 JSON {"path", "column"} from a table header drag
 MAX_DISPLAY = 100_000  # rows the results table holds at most, whatever the limit
 NO_LIMIT_DISPLAY = 10_000  # rows shown when "Limit rows" is off
 MAX_CELL = 500
+MAX_VALUE = 50_000_000  # characters a filter value may hold (a pasted list of ids)
 WIDE_AT, NARROW_AT = 900, 820  # panel width that switches to side-by-side and back (hysteresis)
 KIND_HINT = {'numeric': 'a number', 'date': 'YYYY-MM-DD', 'timestamp': 'YYYY-MM-DD HH:MM'}
 KIND_NAME = {'numeric': 'number', 'date': 'date', 'timestamp': 'date & time', 'text': 'text'}
-DROP_VERB = {'filter': 'filter by', 'group': 'group by', 'show': 'show'}
+DROP_VERB = {'filter': 'filter by', 'group': 'group by', 'show': 'show', 'count': 'count rows per'}
 BUTTON_TEXT = {'export': ('Export…', 'Export results…'), 'open': ('Open as tab', 'Open results as new tab')}
+KEEP = object()  # showOutcome: leave the result as it is
 
 
 def resultsDir():
@@ -149,6 +153,35 @@ class ResultModel(QAbstractTableModel):
         return self.columns[section] if orientation == Qt.Orientation.Horizontal else f'{section + 1:,}'
 
 
+class ValueEdit(QLineEdit):
+    """Filter value box without the 32,767 character cap; pasted lines (a column copied from a sheet) become
+    a comma list, which the IN / NOT IN operators read."""
+
+    def __init__(self):
+        super().__init__()
+        self.setMaxLength(MAX_VALUE)
+
+    def pasteList(self):
+        text = QApplication.clipboard().text()
+        lines = [line.strip() for line in text.replace('\r\n', '\n').split('\n') if line.strip()]
+        self.insert(', '.join(lines) if len(lines) > 1 else text.strip('\r\n'))
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Paste):
+            self.pasteList()
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        for action in menu.actions():
+            if action.objectName() == 'edit-paste':
+                action.triggered.disconnect()
+                action.triggered.connect(self.pasteList)
+        menu.exec(event.globalPos())
+        menu.deleteLater()
+
+
 class FilterRow(QWidget):
     changed = pyqtSignal()
     removed = pyqtSignal(object)
@@ -159,9 +192,9 @@ class FilterRow(QWidget):
         self.compact = False
         self.column = combo([(n, n) for n in names], 8)
         self.op = combo(minChars=8)
-        self.value = QLineEdit()
+        self.value = ValueEdit()
         self.andLabel = QLabel('and')
-        self.value2 = QLineEdit()
+        self.value2 = ValueEdit()
         # Wide rows line up whether or not the value box shows
         policy = self.value.sizePolicy()
         policy.setRetainSizeWhenHidden(True)
@@ -224,10 +257,14 @@ class FilterRow(QWidget):
         self.values.setVisible(op not in builder.NO_VALUE or not self.compact)
         self.andLabel.setVisible(op == 'between')
         self.value2.setVisible(op == 'between')
-        if op == 'one_of':
-            self.value.setPlaceholderText('a, b, c')
+        listOp = op in builder.LIST_OPS
+        self.value.setToolTip('Values separated by commas; a pasted column (one value per line) works too' if listOp else '')
+        if listOp:
+            self.value.setPlaceholderText('a, b, c  (or paste a list)')
         elif op in ('equals', 'not_equals', 'contains', 'not_contains', 'starts_with', 'ends_with'):
             self.value.setPlaceholderText('text (any case)')
+        else:
+            self.value.setPlaceholderText(KIND_HINT.get(builder.kind(self.types.get(self.column.currentData())), 'text'))
         if emit:
             self.changed.emit()
 
@@ -340,7 +377,14 @@ class QueryPanel(QWidget):
         super().__init__()
         self.main = window  # not self.window: QWidget.window() must keep working
         self.engine = None  # made on first need, closed in shutdown()
-        self.tabIds = {}  # path -> tabId
+        self.tables = {}  # path -> the tab's table name
+        self.saved = {}  # norm(path) -> snapshot(): each file keeps its own builder, SQL and result
+        self.restoring = None  # snapshot waiting for the columns of the file just picked
+        self.follow = True  # next refresh picks the window's current tab
+        self.busyPath = None  # file of the running query / export
+        self.pendingSql = None  # (sql, run, ticket) from showQuery, waiting for the tab's columns
+        self.ticket = 0
+        self.finished = {}  # ticket -> outcome of a showQuery run: {path, result, status, error}
         self.path = None
         self.tabKey = None
         self.names, self.types = [], {}
@@ -374,7 +418,7 @@ class QueryPanel(QWidget):
         self.build(outer)
         QApplication.instance().aboutToQuit.connect(self.shutdown)
         tabs = window.tabs
-        tabs.currentChanged.connect(lambda _: self.tabsChanged())
+        tabs.currentChanged.connect(lambda _: self.tabsChanged(follow=True))
         tabs.tabCloseRequested.connect(lambda _: QTimer.singleShot(0, self.tabsChanged))
         tabs.tabBar().tabMoved.connect(lambda *_: self.tabsChanged())
 
@@ -382,11 +426,15 @@ class QueryPanel(QWidget):
 
     def build(self, outer):
         self.fileBox = combo(minChars=12)
-        self.fileBox.activated.connect(lambda _: self.onFile())
+        self.fileBox.setToolTip('The table (open tab) this query is for; each tab keeps its own query')
+        self.fileBox.activated.connect(lambda _: self.onFilePicked())
+        self.renameButton = QToolButton(text='✎', toolTip='Rename this table (also: double-click its tab)')
+        self.renameButton.setAutoRaise(True)
+        self.renameButton.clicked.connect(self.renameTable)
         self.columnsNote = muted('')
-        top = hbox(QLabel('File'), self.fileBox, self.columnsNote, spacing=6)
+        top = hbox(QLabel('Table'), self.fileBox, self.renameButton, self.columnsNote, spacing=6)
         top.setStretch(1, 3)
-        top.setStretch(2, 2)
+        top.setStretch(3, 2)
         outer.addLayout(top)
 
         self.builderPane = QWidget()
@@ -486,8 +534,8 @@ class QueryPanel(QWidget):
         self.sqlPeek.setWordWrap(False)
         self.sqlPeek.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.editSql = QCheckBox('Edit SQL')
-        self.editSql.setToolTip('Write the query yourself; the builder is paused. Views: t1, t2… per tab, '
-                                't1_text for an all-text view')
+        self.editSql.setToolTip('Write the query yourself; the builder is paused. Each tab is a table by the name on '
+                                'its tab (join them freely); <name>_text is an all-text view of it')
         self.editSql.toggled.connect(self.onEditSql)
         row = hbox(self.sqlToggle, self.sqlPeek, self.editSql, spacing=6)
         row.setStretch(1, 1)
@@ -498,7 +546,18 @@ class QueryPanel(QWidget):
         self.sqlBox.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.sqlBox.setTabChangesFocus(True)
         self.sqlBox.setMinimumHeight(60)
-        side.addWidget(self.sqlBox)
+        # SQL above, buttons + results below; the handle between them sizes the SQL box (long queries)
+        self.sqlSplit = QSplitter(Qt.Orientation.Vertical)
+        self.sqlSplit.setChildrenCollapsible(False)
+        self.sqlSplit.addWidget(self.sqlBox)
+        below = QWidget()
+        side.addWidget(self.sqlSplit, 1)
+        side = QVBoxLayout(below)
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(4)
+        self.sqlSplit.addWidget(below)
+        self.sqlSplit.setStretchFactor(0, 0)
+        self.sqlSplit.setStretchFactor(1, 1)
 
         self.runButton = QPushButton('▶ Run', toolTip='Run the query (Ctrl+Enter)', default=True)
         self.runButton.setObjectName('primary')
@@ -592,8 +651,9 @@ class QueryPanel(QWidget):
             self.split.setSizes([440, size - 440] if wide else [int(size * 0.55), int(size * 0.45)])
         self.builderPane.layout().setContentsMargins(0, 0, 8 if wide else 4, 0)
         self.resultsPane.layout().setContentsMargins(6 if wide else 0, 4 if not wide else 0, 0, 0)
-        self.sqlBox.setMaximumHeight(200 if wide else 130)
         self.columnList.setMaximumHeight(150 if wide else 96)
+        # Same SQL box height as before by default; drag the handle under it for long queries
+        self.sqlSplit.setSizes([200 if wide else 130, max(self.height(), 600)])
         self.exportButton.setText(BUTTON_TEXT['export'][wide])
         self.openButton.setText(BUTTON_TEXT['open'][wide])
         self.setSqlOpen(wide if self.sqlChoice[wide] is None else self.sqlChoice[wide])
@@ -670,10 +730,11 @@ class QueryPanel(QWidget):
             self.engine = QueryEngine()
         return self.engine
 
-    def tabsChanged(self):
+    def tabsChanged(self, follow=False):
         # Hidden (other side tab, dock closed): catch up on next show
         if self.closed or not self.available:
             return
+        self.follow = self.follow or follow
         if self.isVisible():
             self.refreshTabs()
         else:
@@ -692,16 +753,20 @@ class QueryPanel(QWidget):
         self.stale = False
         tabs = snapshotTabs(self.main)
         self.engine.setTabs(tabs)
-        self.tabIds = {t.path: t.tabId for t in tabs}
-        byNorm = {norm(p): p for p in self.tabIds}
+        self.tables = {t.path: tableOf(t) for t in tabs}
+        byNorm = {norm(p): p for p in self.tables}
         prefer = byNorm.get(norm(prefer))
         current = next((t.path for t in tabs if t.current), tabs[0].path if tabs else None)
-        keep = prefer or (self.path if self.path in self.tabIds else current)
+        keep = prefer or (current if self.follow or self.path not in self.tables else self.path)
+        self.follow = False
         self.fileBox.blockSignals(True)
         self.fileBox.clear()
+        from csvviewer.sqlviews import defaultTableName
         for t in tabs:
-            self.fileBox.addItem(t.name, t.path)
-            self.fileBox.setItemData(self.fileBox.count() - 1, t.path, Qt.ItemDataRole.ToolTipRole)
+            table = tableOf(t)
+            self.fileBox.addItem(table if table == defaultTableName(t.name) else f'{table} · {t.name}', t.path)
+            self.fileBox.setItemData(self.fileBox.count() - 1, f'{t.path}\nTable name in SQL: {tableOf(t)}',
+                                     Qt.ItemDataRole.ToolTipRole)
         self.fileBox.setCurrentIndex(self.fileBox.findData(keep))
         self.fileBox.blockSignals(False)
         self.onFile()
@@ -711,15 +776,35 @@ class QueryPanel(QWidget):
         self.refreshTabs(prefer=path)
         return self.path is not None and norm(self.path) == norm(path)
 
+    def onFilePicked(self):
+        # Picking a table here shows its tab too, so the panel and the window agree
+        path = self.fileBox.currentData()
+        for i in range(self.main.tabs.count()):
+            tab = self.main.tabs.widget(i)
+            if tab.index and norm(tab.index.path) == norm(path):
+                self.main.tabs.setCurrentIndex(i)
+        self.onFile()
+
     def onFile(self):
         path = self.fileBox.currentData()
         tab = next((t for t in self.engine.tabs.values() if t.path == path), None)
         key = self.engine.tabKey(tab) if tab else None
+        self.renameButton.setEnabled(tab is not None)
         if path != self.path:
+            if self.path:
+                self.saved[norm(self.path)] = self.restoring if self.restoring is not None else self.snapshot()
+            if self.pendingSql:  # meant for the table being left
+                self.finished[self.pendingSql[2]] = {'path': self.path, 'result': None, 'status': '',
+                                                     'error': 'another tab was picked before the query could be shown'}
+                self.pendingSql = None
             self.path = path
             self.pending.clear()
             self.resetBuilder()
             self.setColumns([], {})
+            self.setEditSql(False)
+            self.setSql('')
+            self.restoring = self.saved.get(norm(path)) if path else None
+            self.showOutcome(path, **{k: (self.restoring or {}).get(k) for k in ('result', 'status', 'error')})
         if key != self.tabKey:
             self.tabKey = key
             self.loadColumns()
@@ -736,7 +821,8 @@ class QueryPanel(QWidget):
         self.loading = True
         self.columnsNote.setText('Reading columns…')
         self.builderPane.setEnabled(False)
-        self.job(lambda: self.engine.columns(self.tabIds[self.path]), lambda f: self.onColumns(gen, f))
+        table = self.tables[self.path]
+        self.job(lambda: self.engine.columns(table), lambda f: self.onColumns(gen, f))
 
     def onColumns(self, gen, future):
         if gen != self.columnsGen or self.closed:
@@ -746,18 +832,66 @@ class QueryPanel(QWidget):
             cols = future.result()
         except Exception as e:
             self.pending.clear()
+            self.restoring = None
             self.columnsNote.setText('')
             self.showError(f'Could not read the columns: {e}')
+            if self.pendingSql:
+                self.finished[self.pendingSql[2]] = {'path': self.path, 'result': None, 'status': '',
+                                                     'error': self.errorLabel.text()}
+                self.pendingSql = None
             return
         self.setColumns([c for c, _ in cols], dict(cols))
-        tabId = self.tabIds.get(self.path)
-        textOnly = tabId is not None and self.engine.viewName(tabId).endswith('_text')
-        self.columnsNote.setText(f'{len(cols):,} columns' + (' (as text)' if textOnly else ''))
+        table = self.tables.get(self.path)
+        textOnly = table is not None and self.engine.viewName(table).endswith('_text')
+        self.columnsNote.setText(f'{os.path.basename(self.path)} · {len(cols):,} columns' + (' (as text)' if textOnly else ''))
+        self.columnsNote.setToolTip(self.path)
         self.builderPane.setEnabled(not self.editSql.isChecked())
+        snap, self.restoring = self.restoring, None
+        if snap:
+            self.restore(snap)
         self.changed()
         pending, self.pending = self.pending, []
         for kind, column in pending:
             self.applyColumn(kind, column)
+        self.applyPendingSql()
+
+    # ---------- SQL from outside (the assistant, MCP) ----------
+
+    def showQuery(self, sql, path=None, run=True):
+        """Put SQL into the panel (Edit SQL) of a tab's table (default: the shown one) and run it, as if the user
+        typed it. Returns a ticket; finished[ticket] holds the outcome once it ran, or None when nothing can run."""
+        if not self.available or self.closed or self.busy:
+            return None
+        self.main.showSidePanel('query')
+        if path:
+            for i in range(self.main.tabs.count()):
+                tab = self.main.tabs.widget(i)
+                if tab.index and norm(tab.index.path) == norm(path):
+                    self.main.tabs.setCurrentIndex(i)
+            if not self.selectTabPath(path):
+                return None
+        elif self.stale or self.engine is None:
+            self.refreshTabs()
+        if not self.path:
+            return None
+        self.ticket += 1
+        self.pendingSql = (sql, run, self.ticket)
+        if not self.loading and self.names:
+            self.applyPendingSql()
+        return self.ticket
+
+    def applyPendingSql(self):
+        if not self.pendingSql:
+            return
+        sql, run, ticket = self.pendingSql
+        self.pendingSql = None
+        self.setEditSql(True, sql)
+        self.hideError()
+        if not run:
+            self.finished[ticket] = {'path': self.path, 'result': None, 'status': 'not run', 'error': ''}
+        elif not self.runQuery(ticket):
+            self.finished[ticket] = {'path': self.path, 'result': None, 'status': '',
+                                     'error': self.errorLabel.text() or 'the query did not start'}
 
     def setColumns(self, names, types):
         # New names for every picker; rows keep their choice when the column still exists
@@ -817,6 +951,10 @@ class QueryPanel(QWidget):
     def addGroupForColumn(self, path, column):
         return self.columnAction('group', path, column)
 
+    def countValuesForColumn(self, path, column):
+        """Group by the column with a row count, most rows first, and run it."""
+        return self.columnAction('count', path, column)
+
     def showColumn(self, path, column):
         """Make sure a column is ticked in "Show columns" and scrolled into view."""
         return self.columnAction('show', path, column)
@@ -847,9 +985,14 @@ class QueryPanel(QWidget):
             row = self.addFilter(name)
             QTimer.singleShot(0, lambda: self.reveal(row, row.value))
             return row
-        if kind == 'group':
+        if kind in ('group', 'count'):
             row = next((r for r in self.groups if r.state() == name), None) or self.addGroup(name)
             QTimer.singleShot(0, lambda: self.reveal(row, row.column))
+            if kind == 'count':
+                if not any(r.state() == {'func': 'count', 'column': None} for r in self.summaries):
+                    self.addSummary('count')
+                self.setSort('Count', True)
+                self.runQuery()
             return row
         item = next(self.columnList.item(i) for i in range(self.columnList.count()) if self.columnList.item(i).text() == name)
         if item.isHidden():
@@ -974,9 +1117,14 @@ class QueryPanel(QWidget):
 
     def removeRow(self, rows, row):
         rows.remove(row)
-        row.setParent(None)
-        row.deleteLater()
+        self.dropRow(row)
         self.changed()
+
+    def dropRow(self, row):
+        # Hidden in place, not unparented: an unparented row holding the focus would become a stray window.
+        # Its layout lets go of it when it is deleted.
+        row.hide()
+        row.deleteLater()
 
     def addFilter(self, column=None, op=None, value='', value2=''):
         row = self.addRow(self.filters, self.filterBox, FilterRow(self.names, self.types))
@@ -1004,8 +1152,7 @@ class QueryPanel(QWidget):
     def resetBuilder(self):
         for rows in (self.filters, self.groups, self.summaries):
             for r in rows:
-                r.setParent(None)
-                r.deleteLater()
+                self.dropRow(r)
             rows.clear()
         for w in (self.matchBox, self.sortBox, self.sortDir, self.limitSpin, self.distinct, self.columnFilter):
             w.blockSignals(True)
@@ -1020,12 +1167,15 @@ class QueryPanel(QWidget):
         self.filterColumnList('')
         self.checkColumns(True)
 
+    def checkedColumns(self):
+        return [self.columnList.item(i).text() for i in range(self.columnList.count())
+                if self.columnList.item(i).checkState() == Qt.CheckState.Checked]
+
     def state(self):
-        tabId = self.tabIds.get(self.path, 0)
-        checked = [self.columnList.item(i).text() for i in range(self.columnList.count())
-                   if self.columnList.item(i).checkState() == Qt.CheckState.Checked]
+        table = self.tables.get(self.path)
+        checked = self.checkedColumns()
         sort = self.sortBox.currentData()
-        return {'tabId': tabId, 'view': self.engine.viewName(tabId) if tabId else None, 'types': self.types,
+        return {'tabId': 0, 'view': self.engine.viewName(table) if table else None, 'types': self.types,
                 'columns': [] if len(checked) == len(self.names) else checked,
                 'filters': [r.state() for r in self.filters], 'match': self.matchBox.currentData(),
                 'groupBy': [r.state() for r in self.groups], 'aggregates': [r.state() for r in self.summaries],
@@ -1068,17 +1218,119 @@ class QueryPanel(QWidget):
         self.sqlBox.setPlainText(sql)
         self.sqlPeek.setText(' '.join(sql.split()))
 
-    def onEditSql(self, on):
+    def setEditSql(self, on, sql=None):
+        """Edit SQL on or off without taking the keyboard focus (switching tables); sql replaces the text."""
+        if self.editSql.isChecked() != on:
+            self.editSql.blockSignals(True)
+            self.editSql.setChecked(on)
+            self.editSql.blockSignals(False)
+            self.onEditSql(on, focus=False)
+        if sql is not None:
+            self.setSql(sql)
+
+    def onEditSql(self, on, focus=True):
         self.sqlBox.setReadOnly(not on)
         self.builderPane.setEnabled(not on and bool(self.names))
         self.setSqlOpen(self.sqlToggle.isChecked() or on)
-        if on:
+        if on and focus:
             self.sqlBox.setFocus()
         else:
             self.setSqlOpen(self.wide if self.sqlChoice[self.wide] is None else self.sqlChoice[self.wide])
             self.changed()
 
+    def snapshot(self):
+        """This file's query: builder rows, options, typed SQL and the last result."""
+        return {'checked': self.checkedColumns(), 'filters': [r.state() for r in self.filters],
+                'match': self.matchBox.currentData(), 'groups': [r.state() for r in self.groups],
+                'summaries': [r.state() for r in self.summaries], 'sort': self.sortBox.currentData(),
+                'desc': self.sortDir.currentData(), 'limit': self.limitSpin.value(), 'distinct': self.distinct.isChecked(),
+                'editSql': self.editSql.isChecked(), 'sql': self.sqlBox.toPlainText(), 'result': self.result,
+                'status': self.statusLabel.text(), 'error': self.errorLabel.text()}
+
+    def restore(self, snap):
+        """Rebuild a snapshot() once the file's columns are loaded; columns that are gone are left out."""
+        names = set(self.names)
+        for f in snap['filters']:
+            if f['column'] in names:
+                self.addFilter(f['column'], f['op'], f['value'], f['value2'])
+        for g in snap['groups']:
+            if g in names:
+                self.addGroup(g)
+        for a in snap['summaries']:
+            if a['column'] is None or a['column'] in names:
+                self.addSummary(a['func'], a['column'])
+        self.matchBox.setCurrentIndex(max(0, self.matchBox.findData(snap['match'])))
+        if set(snap['checked']) & names:
+            self.columnList.blockSignals(True)
+            for i in range(self.columnList.count()):
+                item = self.columnList.item(i)
+                item.setCheckState(Qt.CheckState.Checked if item.text() in snap['checked'] else Qt.CheckState.Unchecked)
+            self.columnList.blockSignals(False)
+        self.limitSpin.setValue(snap['limit'])
+        self.distinct.setChecked(snap['distinct'])
+        self.setSort(snap['sort'], snap['desc'])
+        if snap['editSql']:
+            self.setEditSql(True, snap['sql'])
+
+    def showOutcome(self, path, result=KEEP, status=None, error=None):
+        """Show a result / status / error for a file, or keep it with that file's query when another one is shown."""
+        if not path:
+            return
+        if norm(path) != norm(self.path):
+            snap = self.saved.get(norm(path))
+            if snap is not None:
+                snap.update({k: v for k, v in (('result', result), ('status', status), ('error', error)) if v is not KEEP})
+            return
+        if result is not KEEP:
+            self.result = result
+            self.model.setResult(*((result['columns'], result['types'], result['rows']) if result else ()))
+            if result:
+                self.table.resizeColumnsToContents()
+                for c in range(self.model.columnCount()):
+                    self.table.setColumnWidth(c, min(self.table.columnWidth(c), 360))
+        self.statusLabel.setText(status or '')
+        if error:
+            self.showError(error)
+        else:
+            self.hideError()
+
+    def renameTable(self):
+        for i in range(self.main.tabs.count()):
+            tab = self.main.tabs.widget(i)
+            if tab.index and norm(tab.index.path) == norm(self.path):
+                self.main.renameTable(i)
+                return
+
+    def tableRenamed(self, old, new):
+        """A tab got a new table name: typed SQL follows it, the picker shows it."""
+        if not self.available or self.closed:
+            return
+        pattern = re.compile(rf'\b{re.escape(old)}(_text)?\b', re.I)
+        rename = lambda sql: pattern.sub(lambda m: new + (m.group(1) or ''), sql or '')
+        for snap in list(self.saved.values()) + ([self.restoring] if self.restoring else []):
+            if snap.get('editSql'):
+                snap['sql'] = rename(snap['sql'])
+        if self.editSql.isChecked():
+            self.setSql(rename(self.sqlBox.toPlainText()))
+        if self.engine is not None:
+            self.engine.renamed(old, new)
+        self.tabsChanged()
+
+    def fileMoved(self, old, new, oldName, newName):
+        """A tab now shows another file (a query result saved under a name): its query goes along."""
+        if not self.available or self.closed:
+            return
+        if norm(old) in self.saved:
+            self.saved[norm(new)] = self.saved.pop(norm(old))
+        if norm(self.path) == norm(old):
+            self.path = new
+        if oldName != newName:
+            self.tableRenamed(oldName, newName)
+        else:
+            self.tabsChanged()
+
     def clear(self):
+        self.restoring = None  # a query still waiting for its columns is cleared too
         if self.editSql.isChecked():
             self.editSql.setChecked(False)
         self.resetBuilder()
@@ -1109,6 +1361,7 @@ class QueryPanel(QWidget):
             return None
         self.hideError()
         self.busy = kind
+        self.busyPath = self.path
         self.started = time.monotonic()
         self.busyBar.show()
         self.ticker.start()
@@ -1123,40 +1376,43 @@ class QueryPanel(QWidget):
             self.statusLabel.setText(f'{verb}… {time.monotonic() - self.started:.1f} s')
 
     def endBusy(self):
+        path, self.busyPath = self.busyPath, None
         self.busy = None
         self.future = None
         self.ticker.stop()
         self.busyBar.hide()
         self.updateButtons()
+        return path
 
-    def runQuery(self):
+    def runQuery(self, ticket=None):
+        """Run the query; True when it started."""
         if not self.available or self.busy or not self.path or self.closed:
-            return
+            return False
         limit = self.limitSpin.value()
         shown = min(limit or NO_LIMIT_DISPLAY, MAX_DISPLAY)
-        self.startBusy('run', lambda sql: self.engine.run(sql, shown), lambda f: self.onRun(f, limit, shown))
+        typed = self.editSql.isChecked()
+        return self.startBusy('run', lambda sql: self.engine.run(sql, shown),
+                              lambda f: self.onRun(f, limit, shown, typed, ticket)) is not None
 
-    def onRun(self, future, limit, shown):
-        self.endBusy()
+    def onRun(self, future, limit, shown, typed, ticket=None):
+        path = self.endBusy()
         try:
             res = future.result()
         except Exception as e:
-            self.statusLabel.setText('')
-            self.showError(str(e) or 'Stopped.')
+            self.showOutcome(path, status='', error=str(e) or 'Stopped.')
+            if ticket:
+                self.finished[ticket] = {'path': path, 'result': None, 'status': '', 'error': str(e) or 'Stopped.'}
             return
-        self.result = res
-        self.model.setResult(res['columns'], res['types'], res['rows'])
-        self.table.resizeColumnsToContents()
-        for c in range(self.model.columnCount()):
-            self.table.setColumnWidth(c, min(self.table.columnWidth(c), 360))
         n = len(res['rows'])
         if res['more']:
             text = f'First {n:,} rows shown (there are more; export to get them all)'
-        elif limit and n == limit and not self.editSql.isChecked():
+        elif limit and n == limit and not typed:
             text = f'{n:,} rows (stopped at the limit of {limit:,})'
         else:
             text = f'{n:,} row' + ('' if n == 1 else 's')
-        self.statusLabel.setText(f'{text} · {res["seconds"]:.2f} s')
+        self.showOutcome(path, res, f'{text} · {res["seconds"]:.2f} s', '')
+        if ticket:
+            self.finished[ticket] = {'path': path, 'result': res, 'status': f'{text} · {res["seconds"]:.2f} s', 'error': ''}
         self.updateButtons()
 
     def stop(self):
@@ -1185,15 +1441,14 @@ class QueryPanel(QWidget):
         return self.exportTo(os.path.join(resultsDir(), f'{stem}-{time.strftime("%Y%m%d-%H%M%S")}.csv'), True)
 
     def onExport(self, future, openAfter):
-        self.endBusy()
+        path = self.endBusy()
         try:
             res = future.result()
         except Exception as e:
-            self.statusLabel.setText('')
-            self.showError(str(e) or 'Stopped.')
+            self.showOutcome(path, status='', error=str(e) or 'Stopped.')
             return
         rows = f'{res["rows"]:,} rows' if res['rows'] is not None else 'Result'
-        self.statusLabel.setText(f'{rows} saved to {res["path"]} · {res["seconds"]:.2f} s')
+        self.showOutcome(path, status=f'{rows} saved to {res["path"]} · {res["seconds"]:.2f} s', error='')
         self.main.statusBar().showMessage(f'Query result: {rows} saved to {res["path"]}', 10000)
         if openAfter and not self.closed:
             self.main.openPath(res['path'])

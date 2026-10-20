@@ -23,12 +23,16 @@ something is based on a sample.
 small ones, and quote column names with double quotes.
 - Row numbers are 1-based data rows, as shown in the viewer. When you mention specific rows, link them as \
 [row 123](csvrow://<tabId>/123) so the user can click to jump there. Use show_rows when the user asks to see or go to rows.
+- Each tab also has a table name (shown on the tab and in the Query panel); it works in SQL like tN. When the user \
+asks to see, write or run a query in the app, or wants a result table they can export, use show_query: it puts the \
+SQL into their Query panel and runs it there.
 - If a tab is still indexing, say so and work with what is available or ask the user to wait.
 
 How to answer: lead with the answer, keep it short, use a small markdown table when comparing numbers, \
 and mention the SQL you ran only when it helps the user trust or reuse the result."""
 TITLES = {'list_tabs': 'Listing tabs', 'describe_tab': 'Reading sample rows', 'get_rows': 'Reading rows',
-          'search_rows': 'Searching', 'run_sql': 'Running SQL', 'show_rows': 'Showing rows'}
+          'search_rows': 'Searching', 'run_sql': 'Running SQL', 'show_rows': 'Showing rows',
+          'show_query': 'Running SQL in the Query panel'}
 
 
 def contextBlock(tabs):
@@ -40,7 +44,8 @@ def contextBlock(tabs):
         state = '' if t.indexed else ', still indexing'
         search = f', active search "{t.searchTerm}" ({t.searchHits:,} matching rows)' if t.searchTerm else ''
         lines.append(f'tab {t.tabId}: {t.name} - {t.index.dataRows:,} rows, {len(t.columns)} columns, '
-                     f'SQL view t{t.tabId}{" (current tab)" if t.current else ""}{state}{search}')
+                     f'SQL view t{t.tabId}{f" (table {t.table})" if getattr(t, "table", "") else ""}'
+                     f'{" (current tab)" if t.current else ""}{state}{search}')
     return '<open_tabs>\n' + '\n'.join(lines) + '\n</open_tabs>'
 
 
@@ -471,12 +476,28 @@ class Assistant(QObject):
     def applyAction(self, action):
         if action.get('type') == 'showRow':
             self.showRow(action['tabId'], action['row'], action.get('column'))
+        elif action.get('type') == 'showQuery':
+            self.showQuery(action['tabId'], action['query'])
 
-    def showRow(self, tabId, row, column=None):
+    def tabFor(self, tabId):
         tab = self.tabWidgets.get(tabId)
         if tab is None or self.window.tabs.indexOf(tab) < 0:
             # Fall back to the tab currently at that position
             tab = self.window.tabs.widget(tabId - 1)
+        return tab
+
+    def showQuery(self, tabId, query):
+        """Claude's query in the Query panel of a tab, run there; tN as Claude saw it becomes that tab's table name."""
+        from csvviewer.sqlviews import renameRefs
+        tab = self.tabFor(tabId)
+        if tab is None or not tab.index:
+            return
+        names = {f't{n}': w.tableName for n, w in self.tabWidgets.items()
+                 if self.window.tabs.indexOf(w) >= 0 and w.index and w.tableName}
+        self.window.queryPanel.showQuery(renameRefs(query, names), tab.index.path)
+
+    def showRow(self, tabId, row, column=None):
+        tab = self.tabFor(tabId)
         if tab is None or not tab.index:
             return
         self.window.tabs.setCurrentWidget(tab)

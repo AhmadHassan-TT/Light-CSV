@@ -81,6 +81,15 @@ DEFINITIONS = [
           'limit': {'type': 'integer', 'description': 'Rows to return, 1-50, default 20.'}},
          ['tabId', 'text']),
     tool('run_sql', SQL_DESCRIPTION, {'query': {'type': 'string', 'description': 'One DuckDB SQL statement.'}}, ['query']),
+    tool('show_query', "Put a read-only SQL query into the user's Query panel (Edit SQL mode) and run it there, so "
+         "they see the query and its full result table and can change, export or save it. Use it when the user asks "
+         "to see, build or run a query in the app, or to show a result table. Write it like run_sql (t{tabId} views "
+         "or the tab's table name from list_tabs); t{tabId} is turned into the table name the panel uses. The result "
+         "is not returned to you: run the same query with run_sql when you need the numbers.",
+         {'query': {'type': 'string', 'description': 'One read-only DuckDB SQL statement.'},
+          'tabId': {'type': 'integer', 'description': "Tab whose Query panel gets the query; default: the first "
+                    "table the query mentions."}},
+         ['query']),
     tool('show_rows', "Scroll the user's viewer to a row (and optionally a column) and select it, so they can see it.",
          {'tabId': TAB_ID, 'row': {'type': 'integer', 'description': '1-based data row number.'}, 'column': COLUMN},
          ['tabId', 'row']),
@@ -177,6 +186,8 @@ class CsvTools:
             info = {'tabId': t.tabId, 'name': t.name, 'rows': idx.dataRows, 'columnCount': len(cols),
                     'columns': cols[:NAME_LIMIT], 'indexed': idx.done, 'current': t.current,
                     'delimiter': idx.delimiter, 'size': humanSize(idx.size), 'sqlView': f't{t.tabId}'}
+            if t.table:
+                info['table'] = t.table  # the name the user sees on the tab and in the Query panel; works in SQL too
             if not idx.done:
                 info['note'] = 'still indexing, row count is growing'
             if t.searchTerm:
@@ -248,6 +259,21 @@ class CsvTools:
             column = self.columns(tab)[self.columnIndex(tab, column)]
         return f'Shown row {row} in tab {tabId}', {'type': 'showRow', 'tabId': tabId, 'row': row, 'column': column or None}
 
+    def tool_show_query(self, query, tabId=None):
+        if not query.strip():
+            raise ToolError('the query is empty')
+        if tabId is not None:
+            self.tab(tabId)
+        else:
+            refs = [r for r, _ in sqlviews.viewRefs(query) if r in self.tabs]
+            names = {t.table: t.tabId for t in self.tabs.values() if t.table}
+            refs += [names[n] for n, _ in sqlviews.tableRefs(query, list(names))]
+            tabId = refs[0] if refs else next((t.tabId for t in self.tabs.values() if t.current), None)
+        if tabId is None:
+            raise ToolError('no file is open')
+        return (f'Put the query in the Query panel of tab {tabId} and started it; the user sees the result there',
+                {'type': 'showQuery', 'tabId': tabId, 'query': query})
+
     # ---------- SQL ----------
 
     def connect(self):
@@ -263,15 +289,19 @@ class CsvTools:
         return sqlviews.readCsv(tab.path, tab.index, text)
 
     def ensureViews(self, con, query):
-        for tabId, text in sqlviews.viewRefs(query):
-            name = sqlviews.viewName(tabId, text)
-            if name in self.views or tabId not in self.tabs:
+        # t<N> views plus the tabs' own table names
+        byName = {t.table: t for t in self.tabs.values() if t.table}
+        refs = [(tabId, text) for tabId, text in sqlviews.viewRefs(query) if tabId in self.tabs]
+        refs += sqlviews.tableRefs(query, list(byName))
+        for ref, text in refs:
+            tab = self.tabs[ref] if isinstance(ref, int) else byName[ref]
+            name = sqlviews.viewName(ref, text)
+            if name in self.views:
                 continue
             try:
-                tab = self.tabs[tabId]
-                sqlviews.createView(con, tabId, tab.path, tab.index, text)
+                sqlviews.createView(con, ref, tab.path, tab.index, text)
             except Exception as e:
-                raise ToolError(f'could not open tab {tabId} for SQL: {e}')
+                raise ToolError(f'could not open tab {tab.tabId} for SQL: {e}')
             self.views.add(name)
 
     def checkReadOnly(self, con, query):

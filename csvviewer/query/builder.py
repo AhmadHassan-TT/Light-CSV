@@ -10,15 +10,19 @@ from csvviewer.sqlviews import sqlString
 
 TEXT_OPS = [('equals', 'equals'), ('not_equals', 'not equals'), ('contains', 'contains'),
             ('not_contains', 'does not contain'), ('starts_with', 'starts with'), ('ends_with', 'ends with'),
-            ('empty', 'is empty'), ('not_empty', 'is not empty'), ('one_of', 'is one of')]
+            ('empty', 'is empty'), ('not_empty', 'is not empty'), ('one_of', 'is one of (IN)'),
+            ('not_one_of', 'is not one of (NOT IN)')]
 VALUE_OPS = [('=', '='), ('!=', '≠'), ('>', '>'), ('>=', '≥'), ('<', '<'), ('<=', '≤'), ('between', 'between'),
-             ('empty', 'is empty'), ('not_empty', 'is not empty')]
+             ('empty', 'is empty'), ('not_empty', 'is not empty'), ('one_of', 'is one of (IN)'),
+             ('not_one_of', 'is not one of (NOT IN)')]
+LIST_OPS = {'one_of', 'not_one_of'}
+LIST_SPLIT = re.compile(r'[,\n\r\t]+')  # a list value: commas, or one per line / cell as pasted from a column
 NO_VALUE = {'empty', 'not_empty'}
 AGGREGATES = [('count', 'Count rows'), ('count_distinct', 'Count distinct'), ('sum', 'Sum'), ('avg', 'Average'),
               ('min', 'Minimum'), ('max', 'Maximum')]
 NUMBER = re.compile(r'^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$')
 NUMERIC_TYPES = re.compile(r'^(U?(TINY|SMALL|BIG|HUGE)?INT(EGER)?\d*|FLOAT\d*|DOUBLE|REAL|DECIMAL.*|NUMERIC.*)$')
-VIEW = re.compile(r'^t\d+(_text)?$')
+VIEW = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')  # a tab's table name (sqlviews.tableNameError) or t<N>, maybe _text
 
 
 class BuilderError(ValueError):
@@ -62,6 +66,10 @@ def literal(value, k, column):
         raise BuilderError(f'"{v}" is not a {k} (filter on {column}); use {shape}')
 
 
+def listItems(value):
+    return [v.strip() for v in LIST_SPLIT.split(value) if v.strip()]
+
+
 def likePattern(value, before, after):
     # ILIKE pattern with % and _ in the value taken literally (ESCAPE '\')
     v = value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
@@ -89,17 +97,23 @@ def condition(f, types):
         if not value.strip() or not value2.strip():
             return None
         return f'{c} BETWEEN {literal(value, k, column)} AND {literal(value2, k, column)}'
+    if op in LIST_OPS:
+        items = listItems(value)
+        if not items:
+            return None
+        if text:
+            items = [f'lower({sqlString(s)})' for s in items]
+        else:
+            items = [literal(s, k, column) for s in items]
+        test = f"{f'lower({c})' if text else c} {'NOT IN' if op == 'not_one_of' else 'IN'} ({', '.join(items)})"
+        # "not one of" keeps empty cells, like "not equals"
+        return f'({c} IS NULL OR {test})' if op == 'not_one_of' else test
     if not text:
         if not value.strip():
             return None
         v = literal(value, k, column)
         # "not equal" keeps empty cells, as a person would expect
         return f'({c} IS NULL OR {c} <> {v})' if op == '!=' else f'{c} {op} {v}'
-    if op == 'one_of':
-        items = [s.strip() for s in value.split(',') if s.strip()]
-        if not items:
-            return None
-        return f"lower({c}) IN ({', '.join(f'lower({sqlString(s)})' for s in items)})"
     if not value:
         return None
     if op == 'equals':

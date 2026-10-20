@@ -182,6 +182,91 @@ def main():
     if shots:
         window.grab().save(os.path.join(shots, 'filtered.png'))
 
+    # Column functions: unique rows (first of each value), alone and with another filter
+    tab.removeColumnFilter(2)
+    tab.setFilterFromCell(1, ('first', None))
+    waitFor(app, lambda: tab.filterScan.done)
+    tab.tick()
+    firsts = {}
+    for i, r in enumerate(rows):
+        firsts.setdefault(r[1], i)
+    assert visibleIds(tab) == sorted(firsts.values()) and len(visibleIds(tab)) == len(CITIES)
+    assert 'unique city' in tab.filterLabel.text() and header.filterState(1) is True, tab.filterLabel.text()
+    tab.setColumnFilter(2, ('in', frozenset({b'b'})))
+    waitFor(app, lambda: tab.filterScan.done)
+    tab.tick()
+    firsts = {}
+    for i, r in enumerate(rows):
+        if r[2] == 'b':
+            firsts.setdefault(r[1], i)
+    assert visibleIds(tab) == sorted(firsts.values())
+    # The dropdown of a unique column keeps it on OK; the header menu shows it ticked
+    tab.openFilter(header, 1)
+    popup = popups()[0]
+    waitFor(app, lambda: popup.scan.done)
+    popup.rebuild()
+    popup.accept()
+    assert tab.filters[1] == ('first', None)
+    from PyQt6.QtWidgets import QMenu
+    menu = QMenu()
+    tab.columnFunctions(menu, 1)
+    checked = {a.text(): a.isChecked() for a in menu.actions()}
+    assert checked['Unique rows by "city"'] and not checked['Only duplicated "city" values'], checked
+    # Only duplicated values: ids are unique, so none; kinds among a few ids
+    tab.clearFilters()
+    tab.setFilterFromCell(0, ('dups', None))
+    waitFor(app, lambda: tab.filterScan.done)
+    tab.tick()
+    assert visibleIds(tab) == []
+    some = [str(i).encode() for i in range(12)]
+    tab.setColumnFilter(0, ('in', frozenset(some)))
+    tab.setFilterFromCell(2, ('dups', None))
+    waitFor(app, lambda: tab.filterScan.done)
+    tab.tick()
+    kinds = [rows[i][2] for i in range(12)]
+    assert visibleIds(tab) == [i for i in range(12) if kinds.count(rows[i][2]) > 1]
+    # Hide blank rows
+    tab.clearFilters()
+    tab.setFilterFromCell(1, tab.excluding(1, b''))
+    waitFor(app, lambda: tab.filterScan.done)
+    tab.tick()
+    assert visibleIds(tab) == [i for i, r in enumerate(rows) if r[1]]
+    # Count rows with a value (cell menu), among the rows the other filters keep
+    tab.setColumnFilter(2, ('in', frozenset({b'a'})))
+    tab.countValue(1, b'Toronto', 'Toronto')
+    scan = tab.countScans[0][0]
+    waitFor(app, lambda: scan.done)
+    tab.reportCounts()
+    n = sum(1 for r in rows if r[1] == 'Toronto' and r[2] == 'a')
+    assert window.statusBar().currentMessage() == f'{n:,} rows with "Toronto" in city (with the other filters)', \
+        window.statusBar().currentMessage()
+    # Column statistics over the rows on screen
+    tab.clearFilters()
+    from csvviewer.stats import ColumnStatsDialog
+    tab.columnStats(3)
+    dialog = next(w for w in tab.findChildren(ColumnStatsDialog))
+    waitFor(app, lambda: dialog.scan.done)
+    dialog.refresh()
+    qty = [int(r[3]) for r in rows]
+    values = dialog.values()
+    assert values['rows'] == f'{N:,}' and values['blanks'] == '0' and values['distinct'] == '9', values
+    assert values['sum'] == f'{sum(qty):,}' and values['min'] == '1' and values['max'] == '9', values
+    assert values['repeated'] == '9' and values['extra'] == f'{N - 9:,}'
+    top = dialog.scan.top(1)[0]
+    assert top[1] == max(qty.count(q) for q in range(1, 10)) and dialog.list.rowCount() == 9
+    if shots:
+        dialog.grab().save(os.path.join(shots, 'column-stats.png'))
+    dialog.filterToRow(0, 0)  # double-click a value: only its rows
+    assert tab.filters[3] == ('in', frozenset({top[0]})) and not dialog.isVisible()
+    tab.columnStats(1)
+    dialog = [w for w in tab.findChildren(ColumnStatsDialog) if w.isVisible()][0]
+    waitFor(app, lambda: dialog.scan.done)
+    dialog.refresh()
+    assert dialog.values()['blanks'] == f"{sum(1 for r in rows if not r[1] and r[3] == top[0].decode()):,}"
+    assert dialog.values()['numbers'] == '0' and dialog.values()['sum'] == '–'
+    dialog.close()
+    tab.clearFilters()
+
     # Reopening the file drops the filters
     tab.openFile(path)
     waitFor(app, lambda: tab.index.done and tab.columnsReady)

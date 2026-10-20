@@ -57,13 +57,16 @@ def testBuilderSql():
     assert kind('DATE') == 'date' and kind('TIMESTAMP WITH TIME ZONE') == 'timestamp'
     assert kind('VARCHAR') == kind('BOOLEAN') == kind(None) == 'text'
     assert [o for o, _ in operators('VARCHAR')] == ['equals', 'not_equals', 'contains', 'not_contains', 'starts_with',
-                                                     'ends_with', 'empty', 'not_empty', 'one_of']
-    assert [l for _, l in operators('DATE')] == ['=', '≠', '>', '≥', '<', '≤', 'between', 'is empty', 'is not empty']
+                                                     'ends_with', 'empty', 'not_empty', 'one_of', 'not_one_of']
+    assert [l for _, l in operators('DATE')] == ['=', '≠', '>', '≥', '<', '≤', 'between', 'is empty', 'is not empty',
+                                                 'is one of (IN)', 'is not one of (NOT IN)']
     assert buildSql(st()) == 'SELECT *\nFROM t1'
     assert buildSql(st(columns=['name', WEIRD], distinct=True, limit=50)) == \
         'SELECT DISTINCT "name", "my ""odd"" col"\nFROM t1\nLIMIT 50'
     assert buildSql(st(view='t3_text')).endswith('FROM t3_text')
+    assert buildSql(st(view='sales_2024')).endswith('FROM sales_2024')
     expectError(lambda: buildSql(st(view='t1; DROP TABLE x')), 'bad view', BuilderError)
+    expectError(lambda: buildSql(st(view='my table')), 'bad view', BuilderError)
     f = lambda op, v='', v2='', c='name': {'column': c, 'op': op, 'value': v, 'value2': v2}
     # Text operators, case-insensitive
     assert where(f('equals', 'Bob')) == "lower(\"name\") = lower('Bob')"
@@ -75,6 +78,14 @@ def testBuilderSql():
     assert where(f('empty')) == "(\"name\" IS NULL OR \"name\" = '')"
     assert where(f('not_empty')) == "(\"name\" IS NOT NULL AND \"name\" <> '')"
     assert where(f('one_of', " a, O'Brien ,,b ")) == "lower(\"name\") IN (lower('a'), lower('O''Brien'), lower('b'))"
+    # IN / NOT IN: commas, or a pasted column (one per line); numbers and dates are checked
+    assert where(f('one_of', 'a\nB\r\n\tc')) == "lower(\"name\") IN (lower('a'), lower('B'), lower('c'))"
+    assert where(f('not_one_of', 'x, y')) == "(\"name\" IS NULL OR lower(\"name\") NOT IN (lower('x'), lower('y')))"
+    assert where(f('one_of', '1, 2.5\n-3', c='qty')) == '"qty" IN (1, 2.5, -3)'
+    assert where(f('not_one_of', '7', c='qty')) == '("qty" IS NULL OR "qty" NOT IN (7))'
+    assert where(f('one_of', '2026-01-02, 2026-02-03', c='day')) == "\"day\" IN (DATE '2026-01-02', DATE '2026-02-03')"
+    expectError(lambda: where(f('one_of', '1, two', c='qty')), 'not a number', BuilderError)
+    assert where(f('not_one_of', ' , \n', c='qty')) is None
     assert where(f('equals', 'true', c='flag')) == "lower(CAST(\"flag\" AS VARCHAR)) = lower('true')"
     # Blank values leave the filter out until filled
     assert where(f('equals'), f('one_of', ' , '), f('>', ' ', c='qty'), f('between', '1', '', c='qty')) is None
@@ -129,11 +140,27 @@ def testBuilderExecutes():
     assert len(q(f('empty', c=WEIRD))) == 2 and len(q(f('not_empty', c=WEIRD))) == 3
     assert len(q(f('empty', c='qty'))) == 1 and len(q(f('!=', '1', c='qty'))) == 4
     assert len(q(f('one_of', "bob, o'brien"))) == 3
+    assert len(q(f('not_one_of', "bob\no'brien"))) == 2  # '50%_off' and ''
+    assert len(q(f('one_of', '1, 5', c='qty'))) == 2 and len(q(f('not_one_of', '1, 5', c='qty'))) == 3  # NULL kept
     assert len(q(f('equals', 'bob'), f('between', '2', '9', c='qty'), match='any')) == 4
     assert con.execute(buildSql(st(groupBy=[WEIRD], aggregates=[{'func': 'count'}], orderBy=[{'column': 'Count', 'desc': True}],
                                    types={'qty': 'BIGINT'}))).fetchall()[0][1] == 1
     assert con.execute('SELECT count(*) FROM t1').fetchone()[0] == 5
     print('builder executes ok')
+
+
+def testTableNames():
+    from csvviewer.sqlviews import defaultTableName, tableNameError, tableRefs
+    assert defaultTableName('/x/Sales 2024 (1).csv') == 'sales_2024_1'
+    assert defaultTableName('/x/2024.csv') == 't_2024' and defaultTableName('/x/order.csv') == 'order_data'
+    assert defaultTableName('/x/t1.csv') == 't1_data' and defaultTableName('/x/sales_text.csv') == 'sales_text_data'
+    assert defaultTableName('/x/–.csv') == 'data' and defaultTableName('/x/People.csv', ['people', 'PEOPLE_2']) == 'people_3'
+    for bad in ('', '1abc', 'a b', 'a-b', 'select', 'T7', 'x_text', 'a' * 64, 'drop;'):
+        assert tableNameError(bad), bad
+    assert tableNameError('Sales', ['sales']) and tableNameError('sales') is None and tableNameError('_x9') is None
+    assert tableRefs('SELECT * FROM Sales s JOIN "people_TEXT" p ON s.id = p.id -- salesman', ['sales', 'people', 'x']) == \
+        [('sales', False), ('people', True)]
+    print('table names ok')
 
 
 # ---------- engine ----------
@@ -150,6 +177,11 @@ def writeCsv(path):
         w.writerow(HEADER)
         w.writerows(rows)
     return rows
+
+
+def named(tab, table):
+    tab.table = table
+    return tab
 
 
 def tabFor(path, tabId=1):
@@ -231,6 +263,12 @@ def testEngine(path, rows):
     eng.setTabs([tabFor(other, 1), tabFor(path, 2)])
     assert eng.columns(1) == [('x', 'BIGINT'), ('y', 'BIGINT')]
     assert eng.run('SELECT count(*) FROM t2')['rows'][0][0] == N
+    # Named tables: the name follows the file wherever its tab is, in any case, and joins work
+    eng.setTabs([named(tabFor(path, 2), 'people'), named(tabFor(other, 1), 'Other')])
+    assert eng.viewName('PEOPLE') == 'people' and eng.columns('other') == [('x', 'BIGINT'), ('y', 'BIGINT')]
+    assert eng.run('SELECT count(*) FROM People, other_text')['rows'][0][0] == 2 * N
+    expectError(lambda: eng.run('SELECT * FROM t2'), 't2', QueryError)  # numbers no longer stand for tabs
+    expectError(lambda: eng.columns('nope'), 'no open tab called nope', QueryError)
     eng.close()
     print(f'engine ok ({N} rows, export + cancel + read-only)')
 
@@ -421,20 +459,20 @@ def testPanel(path, rows, shots):
     # Edit SQL mode runs the typed SQL; read-only check applies
     dlg.editSql.setChecked(True)
     assert not dlg.builderPane.isEnabled() and not dlg.sqlBox.isReadOnly() and dlg.sqlBox.isVisible()
-    dlg.sqlBox.setPlainText('DROP VIEW t2')
+    dlg.sqlBox.setPlainText('DROP VIEW people')
     dlg.runQuery()
     waitFor(app, lambda: dlg.busy is None)
     assert 'read-only' in dlg.errorLabel.text()
     # Column drags are not builder drops while editing SQL
     assert not dragTo(app, dlg.table.viewport(), path, 'city')
     assert len(dlg.filters) == 2
-    dlg.sqlBox.setPlainText('SELECT * FROM t2 ORDER BY id')
+    dlg.sqlBox.setPlainText('SELECT * FROM people ORDER BY id')
     dlg.limitSpin.setValue(0)
     dlg.runQuery()
     waitFor(app, lambda: dlg.busy is None)
     assert len(dlg.model.rows) == N and not dlg.errorLabel.isVisible()
     # Stop a long query from the panel
-    dlg.sqlBox.setPlainText('SELECT count(*) FROM t2 a, t2 b, t2 c WHERE a.note || b.note <> c.city')
+    dlg.sqlBox.setPlainText('SELECT count(*) FROM people a, people b, PEOPLE c WHERE a.note || b.note <> c.city')
     dlg.runQuery()
     time.sleep(0.5)
     dlg.stop()
@@ -461,9 +499,12 @@ def testPanel(path, rows, shots):
     window.closeTab(window.tabs.count() - 1)
     waitFor(app, lambda: dlg.fileBox.count() == 2)
     assert dlg.fileBox.currentData() == path
+    # Back on the first table: its query comes back (the results tab had its own, empty one)
+    waitFor(app, lambda: dlg.names == HEADER and dlg.groups)
+    assert [g.state() for g in dlg.groups] == ['city'] and len(dlg.filters) == 2
     # Clear resets the builder
     dlg.clear()
-    assert not dlg.filters and not dlg.groups and dlg.sqlBox.toPlainText() == 'SELECT *\nFROM t2\nLIMIT 1000'
+    assert not dlg.filters and not dlg.groups and dlg.sqlBox.toPlainText() == "SELECT *\nFROM people\nLIMIT 1000", (dlg.fileBox.currentText(), dlg.sqlBox.toPlainText(), dlg.editSql.isChecked())
 
     # ---- drag & drop ----
     dlg.window().activateWindow()
@@ -507,11 +548,14 @@ def testPanel(path, rows, shots):
     assert dragTo(app, dlg.groupZone, other, 'x')
     waitFor(app, lambda: dlg.names == ['x', 'y'] and dlg.groups)
     assert dlg.fileBox.currentData() == other and [g.state() for g in dlg.groups] == ['x'] and not dlg.filters
-    assert 'FROM t1' in dlg.sqlBox.toPlainText() and 'GROUP BY "x"' in dlg.sqlBox.toPlainText()
+    assert 'FROM other' in dlg.sqlBox.toPlainText() and 'GROUP BY "x"' in dlg.sqlBox.toPlainText()
     # The same actions without dragging (header right-click menu)
     assert dlg.addFilterForColumn(path, 'amount') is None  # waits for the columns of the other file
     waitFor(app, lambda: dlg.names == HEADER and dlg.filters)
-    assert dlg.fileBox.currentData() == path and [f.state()['column'] for f in dlg.filters] == ['amount']
+    # people kept its own query (four filters, grouped by city); the new filter comes on top
+    assert dlg.fileBox.currentData() == path
+    assert [f.state()['column'] for f in dlg.filters] == ['city', 'qty', 'note', 'day', 'amount'], [f.state() for f in dlg.filters]
+    assert [g.state() for g in dlg.groups] == ['city']
     assert dlg.addGroupForColumn(path, 'note').state() == 'note'
     assert dlg.addFilterForColumn(None, 'CITY').state()['column'] == 'city'  # case-insensitive fallback
     assert dlg.addFilterForColumn(path, 'nope') is None and 'no column "nope"' in dlg.errorLabel.text()
@@ -529,14 +573,139 @@ def testPanel(path, rows, shots):
     print('panel ok (layouts, drops, side-panel actions)')
 
 
+def testPanelTables(path, rows):
+    """Table names on tabs, renaming, one query per tab, count per value, long SQL and pasted lists."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication
+    from csvviewer.app import MainWindow
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    other = os.path.abspath(os.path.join(TMP, 'other.csv'))
+    path = os.path.abspath(path)
+    window.openPath(path)
+    window.openPath(other)
+    waitFor(app, lambda: all(window.tabs.widget(i).index.done for i in range(window.tabs.count())))
+    waitFor(app, lambda: [window.tabs.tabText(i) for i in range(2)] == ['people', 'other'])
+    assert 'Table name in queries: people' in window.tabs.tabToolTip(0)
+    dlg = panelFor(window)
+    # The panel follows the window's tab
+    waitFor(app, lambda: dlg.names == ['x', 'y'])
+    assert dlg.fileBox.currentText() == 'other' and 'FROM other' in dlg.sqlBox.toPlainText()
+    dlg.addFilter('x', 'one_of', '1, 3')
+    dlg.runQuery()
+    waitFor(app, lambda: dlg.busy is None)
+    assert len(dlg.model.rows) == 2, dlg.errorLabel.text()
+    # people gets its own query; other's comes back with its result
+    window.tabs.setCurrentIndex(0)
+    waitFor(app, lambda: dlg.names == HEADER)
+    assert not dlg.filters and dlg.model.rowCount() == 0 and 'FROM people' in dlg.sqlBox.toPlainText()
+    dlg.editSql.setChecked(True)
+    big = 'SELECT count(*) AS n FROM people WHERE id NOT IN (' + ', '.join(f"'{i}'" for i in range(300_000)) + ')'
+    QApplication.clipboard().setText(big)
+    dlg.sqlBox.clear()
+    dlg.sqlBox.paste()
+    assert dlg.sqlBox.toPlainText() == big and len(big) > 2_000_000  # no length limit on pasted SQL
+    dlg.runQuery()
+    window.tabs.setCurrentIndex(1)  # switch away while it runs: the result goes to people's query
+    waitFor(app, lambda: dlg.busy is None, 60)
+    assert dlg.fileBox.currentText() == 'other' and len(dlg.model.rows) == 2 and not dlg.errorLabel.text()
+    window.tabs.setCurrentIndex(0)
+    waitFor(app, lambda: dlg.names == HEADER and dlg.editSql.isChecked())
+    assert dlg.sqlBox.toPlainText() == big and dlg.model.rows == [(0,)], (dlg.model.rows, dlg.errorLabel.text())
+    # The SQL box sits in a splitter, so it can be made as tall as wanted
+    sizes = dlg.sqlSplit.sizes()
+    dlg.sqlSplit.setSizes([sizes[0] + 300, max(80, sizes[1] - 300)])
+    assert dlg.sqlSplit.sizes()[0] > sizes[0]
+    # Renaming: tab, picker and typed SQL follow; bad names are refused
+    dlg.sqlBox.setPlainText('SELECT count(*) FROM people JOIN other_text ON people.id = other_text.x')
+    assert window.renameTable(1, 'select') and window.renameTable(1, 'People') and window.renameTable(1, 'a b')
+    assert window.renameTable(1, 'assets') is None
+    # A renamed tab shows its file name too
+    waitFor(app, lambda: dlg.fileBox.findText('assets · other.csv') >= 0)
+    assert window.tabs.tabText(1) == 'assets · other.csv' and 'Table assets' in window.tabs.widget(1).infoLabel.text()
+    assert dlg.sqlBox.toPlainText() == 'SELECT count(*) FROM people JOIN assets_text ON people.id = assets_text.x'
+    dlg.runQuery()
+    waitFor(app, lambda: dlg.busy is None)
+    assert not dlg.errorLabel.text(), dlg.errorLabel.text()
+    assert window.settings.value('query/tableNames') and 'assets' in window.settings.value('query/tableNames')
+    # The builder on the renamed table
+    window.tabs.setCurrentIndex(1)
+    waitFor(app, lambda: dlg.names == ['x', 'y'])
+    assert 'FROM assets' in dlg.sqlBox.toPlainText() and [f.state()['value'] for f in dlg.filters] == ['1, 3']
+    # Count rows per value (header menu): group + count, most first, and it runs
+    window.tabs.setCurrentIndex(0)
+    waitFor(app, lambda: dlg.names == HEADER)
+    dlg.editSql.setChecked(False)
+    dlg.countValuesForColumn(path, 'city')
+    waitFor(app, lambda: dlg.busy is None and dlg.model.rows)
+    want = {}
+    for r in rows:
+        want[r[1]] = want.get(r[1], 0) + 1
+    assert {(c or ''): n for c, n in dlg.model.rows} == want and dlg.model.columns == ['city', 'Count']
+    assert [n for _, n in dlg.model.rows] == sorted(want.values(), reverse=True)
+    # A pasted column of values becomes an IN list
+    row = dlg.addFilter('id', 'not_one_of')
+    QApplication.clipboard().setText('1\r\n2\n\n3\n')
+    row.value.setFocus()
+    row.value.pasteList()
+    assert row.value.text() == '1, 2, 3' and row.value.maxLength() > 1_000_000
+    assert '"id" NOT IN (1, 2, 3)' in dlg.sqlBox.toPlainText(), dlg.sqlBox.toPlainText()
+    # The active tab's file is selected in the Explorer panel
+    window.explorerDock.show()
+    window.tabs.setCurrentIndex(1)
+    waitFor(app, lambda: window.explorer.model.filePath(window.explorer.view.currentIndex()) == other.replace(os.sep, '/'))
+    window.tabs.setCurrentIndex(0)
+    waitFor(app, lambda: window.explorer.model.filePath(window.explorer.view.currentIndex()) == path.replace(os.sep, '/'))
+    # Open as tab, then Save result as: the tab moves to the saved file, the temporary file goes, the query stays
+    waitFor(app, lambda: dlg.names == HEADER and dlg.filters)
+    assert [f.state()["op"] for f in dlg.filters] == ["not_one_of"], [f.state() for f in dlg.filters]  # restored
+    dlg.removeRow(dlg.filters, dlg.filters[0])
+    dlg.openAsTab()
+    waitFor(app, lambda: dlg.busy is None and window.tabs.count() == 3)
+    resultTab = window.tabs.widget(2)
+    waitFor(app, lambda: resultTab.index.done and dlg.fileBox.count() == 3)
+    temp = resultTab.index.path
+    assert resultTab.saveBtn.isVisibleTo(resultTab) and not window.tabs.widget(0).saveBtn.isVisibleTo(window.tabs.widget(0))
+    waitFor(app, lambda: dlg.names == ['city', 'Count'])
+    dlg.addFilter('Count', '>', '400')
+    saved = os.path.join(TMP, 'city counts.csv')
+    assert window.saveTabAs(resultTab, path) and window.saveTabAs(resultTab, temp)  # open elsewhere / itself
+    assert window.saveTabAs(resultTab, saved) is None
+    waitFor(app, lambda: not window.copies and resultTab.index.path == os.path.abspath(saved))
+    waitFor(app, lambda: resultTab.index.done and window.tabs.tabText(2) == 'city_counts')
+    assert not os.path.exists(temp) and not resultTab.saveBtn.isVisibleTo(resultTab) and 'Saved' in window.statusBar().currentMessage()
+    with open(saved, newline='', encoding='utf-8') as f:
+        assert next(csv.reader(f)) == ['city', 'Count']
+    waitFor(app, lambda: dlg.fileBox.currentText() == 'city_counts' and dlg.names == ['city', 'Count'])
+    assert [f.state()['column'] for f in dlg.filters] == ['Count'] and 'FROM city_counts' in dlg.sqlBox.toPlainText(), ([f.state() for f in dlg.filters], dlg.sqlBox.toPlainText())
+    # Any other tab: Save a copy as keeps the tab on its own file
+    copyPath = os.path.join(TMP, 'people copy.csv')
+    assert window.saveTabAs(window.tabs.widget(0), copyPath) is None
+    waitFor(app, lambda: not window.copies)
+    assert window.tabs.widget(0).index.path == path and open(copyPath, 'rb').read() == open(path, 'rb').read()
+    # The assistant's show_query: tN as it saw the tabs becomes the table name, in that tab's panel, and runs
+    window.assistant.tabWidgets = {i + 1: window.tabs.widget(i) for i in range(window.tabs.count())}
+    window.assistant.applyAction({'type': 'showQuery', 'tabId': 2, 'query': 'SELECT count(*) AS n FROM t2 JOIN t1 ON true'})
+    waitFor(app, lambda: dlg.fileBox.currentData() == other and dlg.busy is None and dlg.model.columns == ['n'])
+    assert dlg.editSql.isChecked() and dlg.sqlBox.toPlainText() == 'SELECT count(*) AS n FROM assets JOIN people ON true'
+    assert dlg.model.rows == [(2 * N,)] and window.tabs.currentIndex() == 1, (dlg.model.rows, dlg.errorLabel.text())
+    dlg.shutdown()
+    window.close()
+    print('panel tables ok (names, rename, per-tab queries, count per value, long SQL, IN lists, explorer, save as, '
+          'assistant show_query)')
+
+
 def main():
     shots = sys.argv[1] if len(sys.argv) > 1 else None
     testBuilderSql()
     testBuilderExecutes()
+    testTableNames()
     path = os.path.join(TMP, 'people.csv')
     rows = writeCsv(path)
     testEngine(path, rows)
     testPanel(path, rows, shots)
+    testPanelTables(path, rows)
     print('all query tests passed')
 
 

@@ -1,4 +1,4 @@
-"""QueryEngine: one DuckDB connection with views t<N> / t<N>_text over the open tabs; no Qt.
+"""QueryEngine: one DuckDB connection with a view <name> / <name>_text per open tab (its table name); no Qt.
 
 Blocking calls (columns, run, export) are safe from any thread, each on its own cursor; submit() runs one on the
 engine's worker pool and returns a concurrent Future, which is how the dialog keeps the GUI thread free.
@@ -20,9 +20,9 @@ class QueryError(Exception):
 class QueryEngine:
     def __init__(self):
         self.con = None
-        self.tabs = {}  # tabId -> tab (tabId, name, path, index)
+        self.tabs = {}  # table name -> tab (tabId, name, path, index, table)
         self.viewKeys = {}  # view name -> file + options it was made from
-        self.textOnly = set()  # tabIds whose typed view failed, so the text view stands in
+        self.textOnly = set()  # table names whose typed view failed, so the text view stands in
         self.active = set()  # cursors of running run / export calls
         self.stopped = False
         self.lock = threading.RLock()
@@ -40,45 +40,64 @@ class QueryEngine:
             return self.con
 
     def setTabs(self, tabs):
-        """Tabs as TabInfo-like objects (tabId, name, path, index); views follow on next use."""
+        """Tabs as TabInfo-like objects (tabId, name, path, index, table); views follow on next use."""
         with self.lock:
-            self.tabs = {t.tabId: t for t in tabs}
+            self.tabs = {tableOf(t): t for t in tabs}
+            # Views of closed or renamed tabs go, so a query never reads a table that is no longer shown
+            for name in [n for n in self.viewKeys if n.removesuffix('_text') not in self.tabs]:
+                del self.viewKeys[name]
+                if self.con is not None:
+                    self.con.execute(f'DROP VIEW IF EXISTS "{name}"')
 
     def tabKey(self, tab):
         idx = tab.index
         return (tab.path, idx.delimiter, idx.encoding, idx.hasHeader)
 
-    def ensureView(self, tabId, text=False):
+    def ensureView(self, table, text=False):
         con = self.connect()
-        name = sqlviews.viewName(tabId, text)
+        table = self.resolve(table)
+        name = sqlviews.viewName(table, text)
         with self.lock:
-            tab = self.tabs.get(tabId)
+            tab = self.tabs.get(table)
             if tab is None:
-                raise QueryError(f'There is no open tab {tabId}.')
+                raise QueryError(f'There is no open tab called {table}.')
             key = self.tabKey(tab)
             if self.viewKeys.get(name) != key:
                 try:
-                    sqlviews.createView(con, tabId, tab.path, tab.index, text)
+                    sqlviews.createView(con, table, tab.path, tab.index, text)
                 except Exception as e:
                     raise QueryError(f'Could not read {tab.name}: {sqlviews.shortError(str(e))}')
                 self.viewKeys[name] = key
                 if not text:
-                    self.textOnly.discard(tabId)
+                    self.textOnly.discard(table)
         return name
 
-    def viewName(self, tabId):
-        """The view the builder should query for a tab: typed, or the text view when typing failed."""
-        return sqlviews.viewName(tabId, tabId in self.textOnly)
+    def renamed(self, old, new):
+        """A tab's table name changed; its views are made under the new name on next use."""
+        with self.lock:
+            if old in self.textOnly:
+                self.textOnly.discard(old)
+                self.textOnly.add(new)
 
-    def columns(self, tabId):
+    def resolve(self, table):
+        # A tab number (1, 2…) stands for t<N> when tabs carry no name; any case of a name finds it
+        table = sqlviews.viewName(table) if isinstance(table, int) else table
+        return next((n for n in self.tabs if n.lower() == table.lower()), table)
+
+    def viewName(self, table):
+        """The view the builder should query for a tab: typed, or the text view when typing failed."""
+        table = self.resolve(table)
+        return sqlviews.viewName(table, table in self.textOnly)
+
+    def columns(self, table):
         """[(name, duckdbType)] of a tab via DESCRIBE; falls back to the all-text view."""
         cur = self.connect().cursor()
         try:
             try:
-                return [(r[0], r[1]) for r in cur.execute(f'DESCRIBE {self.ensureView(tabId)}').fetchall()]
+                return [(r[0], r[1]) for r in cur.execute(f'DESCRIBE "{self.ensureView(table)}"').fetchall()]
             except Exception:
-                cols = [(r[0], r[1]) for r in cur.execute(f'DESCRIBE {self.ensureView(tabId, True)}').fetchall()]
-                self.textOnly.add(tabId)
+                cols = [(r[0], r[1]) for r in cur.execute(f'DESCRIBE "{self.ensureView(table, True)}"').fetchall()]
+                self.textOnly.add(self.resolve(table))
                 return cols
         except QueryError:
             raise
@@ -97,9 +116,10 @@ class QueryEngine:
         error = sqlviews.readOnlyError(con, sql)
         if error:
             raise QueryError(error[0].upper() + error[1:])
-        for tabId, text in sqlviews.viewRefs(sql):
-            if tabId in self.tabs:
-                self.ensureView(tabId, text)
+        with self.lock:
+            names = list(self.tabs)
+        for table, text in sqlviews.tableRefs(sql, names):
+            self.ensureView(table, text)
         return sql
 
     def execute(self, sql, fetch):
@@ -176,5 +196,10 @@ def friendly(msg):
     # Short DuckDB cause, plus a hint for the type-detection case
     msg = sqlviews.shortError(msg)
     if 'Conversion Error' in msg or 'Could not convert' in msg:
-        msg += '\nA value did not match the type detected for its column; query the text view (t<N>_text) instead.'
+        msg += '\nA value did not match the type detected for its column; query the text view (<table>_text) instead.'
     return msg
+
+
+def tableOf(tab):
+    """A tab's table name: its own, or t<tabId> for tabs without one."""
+    return getattr(tab, 'table', '') or sqlviews.viewName(tab.tabId)

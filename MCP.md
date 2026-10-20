@@ -59,7 +59,7 @@ The port is 8765, or the next free one if it is taken - the dialog always shows 
 
 ## Tools
 
-Tabs are numbered by position (`tabId` 1, 2, …). Rows are 1-based data rows, as in the viewer's row header. Each open tab is also a DuckDB SQL view `t1`, `t2`, … (plus `t1_text`, which reads every column as text).
+Tabs are numbered by position (`tabId` 1, 2, …). Rows are 1-based data rows, as in the viewer's row header. Each open tab is also a DuckDB SQL view `t1`, `t2`, … (plus `t1_text`, which reads every column as text), and also works under its table name, the one shown on the tab and in the Query panel (`get_app_state` / `list_tabs` give it as `table`).
 
 | Tool | What it does |
 |---|---|
@@ -71,6 +71,7 @@ Tabs are numbered by position (`tabId` 1, 2, …). Rows are 1-based data rows, a
 | `get_rows` | Read up to 100 rows from any position |
 | `search_rows` | Search the whole file (optionally one column, case-sensitive) without touching the UI |
 | `run_sql` | Read-only DuckDB SQL over the full files (`SELECT`, `DESCRIBE`, `SUMMARIZE`, …), up to 200 result rows |
+| `show_query` | Put a read-only query into the app's Query panel (Edit SQL) and run it there, so the user sees, edits, exports or saves the result; `t1`, `t2` become the table names; returns the status, any error and the first 20 rows |
 | `go_to_row` | Select a row (and column) in the viewer and scroll to it |
 | `set_search` / `clear_search` | Drive the tab's search bar, optionally "only matches", and wait for the result |
 | `set_frozen_columns` | Pin the first N columns |

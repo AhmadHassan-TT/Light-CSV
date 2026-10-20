@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 
 from .explorer import Explorer
 from .filters import FilterPopup
-from .index import ColumnScan, CsvIndex, Export, Search
+from .index import ColumnScan, CsvIndex, Export, FileCopy, Search
 
 ROW_HEIGHT = 22
 FILTER_BUTTON = 18  # width of the ▾ button on a filtered column's header
@@ -77,6 +77,15 @@ def applyTheme(theme, systemStyle):
 def samePath(a, b):
     # Windows paths are case-insensitive
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def isQueryResult(path):
+    """True for a query result opened as a tab: a temporary file in the app's query-results folder."""
+    from .query.dialog import resultsDir
+    try:
+        return os.path.normcase(os.path.dirname(os.path.abspath(path))) == os.path.normcase(os.path.abspath(resultsDir()))
+    except OSError:
+        return False
 
 
 def humanSize(n):
@@ -454,6 +463,9 @@ class CsvTab(QWidget):
         self.mapPending = False  # filters plus "only matches" wait for both scans to intersect them
         self.columnsReady = False
         self.firstJumpPending = False
+        self.tableName = ''  # SQL table name in the Query panel; set by MainWindow, the user can rename it
+        self.namedByUser = False  # True once renamed (now or remembered from an earlier rename)
+        self.countScans = []  # (scan, message) for "Count rows with …", reported when done
         self.model = CsvModel()
         self.table = FrozenTable(self.model)
         self.buildSearchBar()
@@ -476,6 +488,10 @@ class CsvTab(QWidget):
         # A long path must not stop the window from giving width to the side panels; it clips instead
         self.infoLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.cellLabel = QLabel('')
+        self.saveBtn = QToolButton(text='Save result as…')
+        self.saveBtn.setToolTip('This query result is a temporary file; save it under a name and folder you choose')
+        self.saveBtn.clicked.connect(lambda: self.window.saveTabAs(self))
+        self.saveBtn.hide()
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
         self.progress.setFormat('Indexing %p%')
@@ -498,6 +514,7 @@ class CsvTab(QWidget):
         self.clearFiltersBtn.hide()
         info.addWidget(self.clearFiltersBtn)
         info.addWidget(self.cellLabel)
+        info.addWidget(self.saveBtn)
         info.addWidget(self.progress)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -571,7 +588,11 @@ class CsvTab(QWidget):
     def title(self):
         if not self.index:
             return 'Empty'
-        name = os.path.basename(self.index.path)
+        from .sqlviews import defaultTableName
+        file = os.path.basename(self.index.path)
+        name = self.tableName or file
+        if self.tableName and self.tableName != defaultTableName(file):
+            name = f'{self.tableName} · {file}'  # renamed: the file stays recognizable
         return name if self.index.done else f'{name} ({self.index.progress:.0%})'
 
     def setDetailVisible(self, on):
@@ -589,6 +610,7 @@ class CsvTab(QWidget):
             return False
         self.index = index
         self.columnsReady = False
+        self.saveBtn.setVisible(isQueryResult(path))
         self.model.load(index)
         self.progress.setValue(0)
         self.progress.show()
@@ -606,6 +628,9 @@ class CsvTab(QWidget):
 
     def closeFile(self):
         self.stopSearch()
+        for scan, _ in self.countScans:
+            scan.cancel()
+        self.countScans = []
         if self.export:
             self.export.cancelled = True
             self.export.thread.join()
@@ -647,7 +672,7 @@ class CsvTab(QWidget):
         idx = self.index
         if not idx:
             return
-        wasDone = not self.progress.isVisible()
+        wasDone = self.progress.isHidden()  # isVisible() is False for every background tab
         if not self.columnsReady and (idx.rowsIndexed >= 2000 or idx.done):
             self.setupColumns()
         if self.columnsReady:
@@ -662,9 +687,11 @@ class CsvTab(QWidget):
             self.titleChanged.emit()
         state = '' if idx.done else '  ·  indexing…'
         delim = {'\t': 'tab', ',': 'comma', ';': 'semicolon', '|': 'pipe'}.get(idx.delimiter, repr(idx.delimiter))
-        self.infoLabel.setText(f'{idx.path}  ·  {humanSize(idx.size)}  ·  {idx.dataRows:,} rows  ·  '
+        table = f'Table {self.tableName}  ·  ' if self.tableName else ''
+        self.infoLabel.setText(f'{table}{idx.path}  ·  {humanSize(idx.size)}  ·  {idx.dataRows:,} rows  ·  '
                                f'{self.model.columnCount()} columns  ·  {delim}  ·  {idx.encoding}{state}')
         self.updateFilterStatus()
+        self.reportCounts()
         s = self.search
         if s:
             if s.done:
@@ -919,6 +946,8 @@ class CsvTab(QWidget):
             if any(self.filters.values()):
                 menu.addAction('Clear all filters', self.clearFilters)
             menu.addSeparator()
+            self.columnFunctions(menu, col)
+            menu.addSeparator()
             menu.addAction(f'Hide "{self.model.columns[col]}"', lambda: self.table.setColumnHidden(col, True))
             menu.addAction('Freeze columns up to here', lambda: self.freezeSpin.setValue(col + 1))
             menu.addAction('Search in this column', lambda: (self.columnBox.setCurrentIndex(col + 1), self.focusSearch()))
@@ -927,12 +956,58 @@ class CsvTab(QWidget):
             name, path = self.model.columns[col], self.index.path
             menu.addAction('Filter by this column in Query', lambda: self.toQuery('addFilterForColumn', path, name))
             menu.addAction('Group by this column in Query', lambda: self.toQuery('addGroupForColumn', path, name))
+            menu.addAction('Count rows per value in Query', lambda: self.toQuery('countValuesForColumn', path, name))
             menu.addSeparator()
         menu.addAction('Unfreeze all', lambda: self.freezeSpin.setValue(0))
         menu.addSeparator()
         menu.addAction('Columns…', self.columnsDialog)
         menu.addAction('Show all columns', self.showAllColumns)
         menu.exec(header.mapToGlobal(pos))
+
+    def columnFunctions(self, menu, col):
+        """Unique / duplicate rows, hide blanks and statistics for a column (header and cell menus)."""
+        name = self.model.columns[col]
+        mode = (self.filters.get(col) or (None,))[0]
+        for key, text, tip in (('first', f'Unique rows by "{name}"', 'Keep only the first row of each value (distinct)'),
+                               ('dups', f'Only duplicated "{name}" values', 'Keep only rows whose value appears more than once')):
+            action = menu.addAction(text, lambda k=key: self.setFilterFromCell(col, None if mode == k else (k, None)))
+            action.setCheckable(True)
+            action.setChecked(mode == key)
+            action.setToolTip(tip)
+        menu.addAction(f'Hide rows with blank "{name}"', lambda: self.setFilterFromCell(col, self.excluding(col, b'')))
+        menu.addAction('Column statistics (count, distinct, sum)…', lambda: self.columnStats(col))
+        menu.setToolTipsVisible(True)
+
+    def columnStats(self, col):
+        if not self.index.done:
+            self.window.statusBar().showMessage('Statistics work once indexing has finished', 5000)
+            return
+        from .stats import ColumnStatsDialog
+        ColumnStatsDialog(self, col).show()
+
+    def excluding(self, col, raw):
+        """The column's filter with one more value hidden."""
+        spec = self.filters.get(col)
+        if spec and spec[0] == 'in':
+            return ('in', spec[1] - {raw})
+        return ('out', (spec[1] if spec and spec[0] == 'out' else frozenset()) | {raw})
+
+    def countValue(self, col, raw, shown):
+        """Count the rows with this value in the column (among rows the other filters keep); shown when done."""
+        if not self.index.done:
+            self.window.statusBar().showMessage('Counting works once indexing has finished', 5000)
+            return
+        others = {c: spec for c, spec in self.filters.items() if spec and c != col}
+        scan = ColumnScan(self.index, others | {col: ('in', frozenset([raw]))}).start()
+        where = f'"{shown}" in {self.model.columns[col]}' + (' (with the other filters)' if others else '')
+        self.countScans.append((scan, where))
+        self.window.statusBar().showMessage(f'Counting rows with {where}…')
+
+    def reportCounts(self):
+        for scan, where in [c for c in self.countScans if c[0].done]:
+            self.countScans.remove((scan, where))
+            n = len(scan.hits)
+            self.window.statusBar().showMessage(f'{n:,} row{"" if n == 1 else "s"} with {where}', 15000)
 
     def toQuery(self, method, path, column):
         # Same as dragging the header into the Query panel
@@ -1072,8 +1147,11 @@ class CsvTab(QWidget):
         if fs and self.index:
             n = sum(1 for spec in self.filters.values() if spec)
             busy = '' if fs.done else f'  ·  filtering {fs.progress:.0%}'
-            self.filterLabel.setText(f'Filtered ({n} column{"s" if n != 1 else ""}): {len(fs.hits):,} of '
-                                     f'{self.index.dataRows:,} rows{busy}')
+            modes = {'first': 'unique', 'dups': 'duplicated'}
+            what = ', '.join(f'{modes[spec[0]]} {self.model.columns[c]}' for c, spec in sorted(self.filters.items())
+                             if spec and spec[0] in modes and c < len(self.model.columns))
+            self.filterLabel.setText(f'Filtered ({n} column{"s" if n != 1 else ""}{": " + what if what else ""}): '
+                                     f'{len(fs.hits):,} of {self.index.dataRows:,} rows{busy}')
 
     def cellMenu(self, view, pos):
         idx = view.indexAt(pos)
@@ -1089,13 +1167,12 @@ class CsvTab(QWidget):
         menu.addAction('Copy with header', lambda: self.copySelection(withHeader=True))
         menu.addSeparator()
         menu.addAction(f'Filter to "{shown}"', lambda: self.setFilterFromCell(col, ('in', frozenset([raw]))))
-        if spec and spec[0] == 'in':
-            excluded = ('in', spec[1] - {raw})
-        else:
-            excluded = ('out', (spec[1] if spec and spec[0] == 'out' else frozenset()) | {raw})
-        menu.addAction(f'Hide rows with "{shown}"', lambda: self.setFilterFromCell(col, excluded))
+        menu.addAction(f'Hide rows with "{shown}"', lambda: self.setFilterFromCell(col, self.excluding(col, raw)))
+        menu.addAction(f'Count rows with "{shown}"', lambda: self.countValue(col, raw, shown))
         if spec:
             menu.addAction(f'Clear filter on "{self.model.columns[col]}"', lambda: self.setColumnFilter(col, None))
+        menu.addSeparator()
+        self.columnFunctions(menu, col)
         menu.exec(view.viewport().mapToGlobal(pos))
 
     def setFilterFromCell(self, col, spec):
@@ -1145,6 +1222,7 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabs.tabBar().customContextMenuRequested.connect(self.tabMenu)
         self.tabs.currentChanged.connect(self.onTabChanged)
+        self.tabs.tabBarDoubleClicked.connect(lambda i: i >= 0 and self.renameTable(i))
         newTab = QToolButton(text='+', toolTip='Open a file in a new tab (Ctrl+T)')
         newTab.setAutoRaise(True)
         newTab.clicked.connect(self.openDialog)
@@ -1163,6 +1241,8 @@ class MainWindow(QMainWindow):
         self.explorerDock.setObjectName('explorer')
         self.explorerDock.setWidget(self.explorer)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.explorerDock)
+        self.explorerDock.visibilityChanged.connect(lambda on: on and QTimer.singleShot(0, self.revealInExplorer))
+        self.copies = {}  # tab -> FileCopy of a running "Save as" 
         # One right-hand side panel with two tabs: the Assistant and the Query builder
         self.sideDock = QDockWidget('Assistant', self)
         self.sideDock.setObjectName('sidepanel')
@@ -1216,6 +1296,7 @@ class MainWindow(QMainWindow):
         file = self.menuBar().addMenu('&File')
         self.act(file, '&Open in new tab…', self.openDialog, [QKeySequence.StandardKey.Open, QKeySequence('Ctrl+T')])
         self.act(file, 'Reopen with &options…', lambda: self.onTab('reopenWithOptions'), 'Ctrl+Shift+O')
+        self.act(file, '&Save as…', lambda: self.saveTabAs(self.current()), 'Ctrl+Shift+S')
         file.addSeparator()
         self.act(file, '&Export matching / filtered rows…', lambda: self.onTab('exportMatches'), 'Ctrl+E')
         file.addSeparator()
@@ -1324,15 +1405,70 @@ class MainWindow(QMainWindow):
             tab.deleteLater()
             return
         tab.titleChanged.connect(lambda t=tab: self.updateTabTitle(t))
+        tab.tableName, tab.namedByUser = self.tableNameFor(path)
         i = self.tabs.addTab(tab, tab.title())
-        self.tabs.setTabToolTip(i, path)
         self.tabs.setCurrentIndex(i)
+        self.updateTabTitle(tab)
         self.stack.setCurrentIndex(1)
+
+    def tableNames(self, skip=None):
+        return [t.tableName for t in (self.tabs.widget(i) for i in range(self.tabs.count())) if t is not skip and t.tableName]
+
+    def savedTableNames(self):
+        try:
+            names = json.loads(self.settings.value('query/tableNames', '{}'))
+        except (TypeError, ValueError):
+            names = {}
+        return names if isinstance(names, dict) else {}
+
+    def tableNameFor(self, path):
+        """(name, renamed): the name a file had last time it was renamed, if still free; else one made from the file name."""
+        from .sqlviews import defaultTableName, tableNameError
+        taken = self.tableNames()
+        saved = self.savedTableNames().get(os.path.normcase(os.path.abspath(path)))
+        if isinstance(saved, str) and not tableNameError(saved, taken):
+            return saved, True
+        return defaultTableName(path, taken), False
+
+    def renameTable(self, i, name=None):
+        """Ask for (or set) a tab's SQL table name; returns an error message or None."""
+        from .sqlviews import tableNameError
+        tab = self.tabs.widget(i)
+        if not tab or not tab.index:
+            return 'no file open in that tab'
+        ask = name is None
+        name = tab.tableName if ask else name
+        while True:
+            if ask:
+                name, ok = QInputDialog.getText(self, 'Rename table', f'Name of {os.path.basename(tab.index.path)} in '
+                                                'queries (letters, digits and _):', text=name)
+                if not ok:
+                    return None
+            name = name.strip()
+            error = tableNameError(name, self.tableNames(skip=tab)) if name != tab.tableName else None
+            if not error:
+                break
+            if not ask:
+                return error
+            QMessageBox.warning(self, 'Rename table', f'Cannot use "{name}": {error}.')
+        if name != tab.tableName:
+            old, tab.tableName = tab.tableName, name
+            tab.namedByUser = True
+            names = self.savedTableNames()
+            names[os.path.normcase(os.path.abspath(tab.index.path))] = name
+            self.settings.setValue('query/tableNames', json.dumps(names))
+            self.updateTabTitle(tab)
+            tab.tick()
+            self.queryPanel.tableRenamed(old, name)
+        return None
 
     def updateTabTitle(self, tab):
         i = self.tabs.indexOf(tab)
         if i >= 0:
             self.tabs.setTabText(i, tab.title())
+            if tab.index:
+                self.tabs.setTabToolTip(i, f'{tab.index.path}\nTable name in queries: {tab.tableName}\n'
+                                           'Double-click to rename')
             if tab is self.current():
                 self.setWindowTitle(f'{tab.title()} — CSV Viewer')
 
@@ -1380,12 +1516,17 @@ class MainWindow(QMainWindow):
             return
         count = self.tabs.count()
         menu = QMenu(self)
+        tab = self.tabs.widget(i)
+        if tab.index:
+            menu.addAction(f'Rename table "{tab.tableName}"…', lambda: self.renameTable(i))
+            menu.addAction('Save result as…' if isQueryResult(tab.index.path) else 'Save a copy as…',
+                           lambda: self.saveTabAs(tab))
+            menu.addSeparator()
         menu.addAction('Close', lambda: self.closeTab(i))
         menu.addAction('Close other tabs', lambda: self.closeOthers(i)).setEnabled(count > 1)
         menu.addAction('Close tabs to the right', lambda: self.closeToRight(i)).setEnabled(i < count - 1)
         menu.addSeparator()
         menu.addAction('Close all tabs', self.closeAll)
-        tab = self.tabs.widget(i)
         if tab.index:
             menu.addSeparator()
             menu.addAction('Copy file path', lambda: QApplication.clipboard().setText(tab.index.path))
@@ -1401,11 +1542,85 @@ class MainWindow(QMainWindow):
         if tab:
             self.detailAct.setChecked(tab.detailBox.isVisible())
             self.setWindowTitle(f'{tab.title()} — CSV Viewer')
+            self.revealInExplorer(tab)
+
+    def revealInExplorer(self, tab=None):
+        """Select the file of a tab (default: the current one) in the Explorer panel while it is shown."""
+        tab = tab or self.current()
+        if tab and tab.index and self.explorerDock.isVisible() and not isQueryResult(tab.index.path):
+            self.explorer.revealFile(tab.index.path)
 
     def tick(self):
         # Background tabs keep indexing / searching, so all of them refresh
         for i in range(self.tabs.count()):
             self.tabs.widget(i).tick()
+        for tab, copy in list(self.copies.items()):
+            if copy.done:
+                self.finishSave(tab, copy)
+            else:
+                self.statusBar().showMessage(f'Saving {os.path.basename(copy.path)}… {copy.progress:.0%}')
+
+    # ---------- save as ----------
+
+    def saveTabAs(self, tab, path=None):
+        """Save a tab's file under a new name. A query result tab then shows the saved file (its temporary
+        file goes); any other tab is copied and stays on its own file. Returns an error message or None."""
+        if not tab or not tab.index:
+            return 'no file open'
+        source = tab.index.path
+        result = isQueryResult(source)
+        if path is None:
+            start = self.settings.value('query/exportDir') if result else os.path.dirname(source)
+            stem = tab.tableName or os.path.splitext(os.path.basename(source))[0]
+            ext = os.path.splitext(source)[1] or '.csv'
+            path, _ = QFileDialog.getSaveFileName(self, 'Save result as' if result else 'Save a copy as',
+                                                  os.path.join(start or os.path.expanduser('~'), stem + ext),
+                                                  'CSV files (*.csv);;All files (*)')
+            if not path:
+                return None
+            ask = True
+        else:
+            ask = False
+        path = os.path.abspath(path)
+        error = None
+        if tab in self.copies:
+            error = 'this tab is already being saved'
+        elif samePath(path, source):
+            error = 'choose a different file than the one open in this tab'
+        elif any(t.index and samePath(t.index.path, path) for t in (self.tabs.widget(i) for i in range(self.tabs.count()))):
+            error = 'that file is open in another tab; close it first'
+        if error:
+            if ask:
+                QMessageBox.warning(self, 'Save as', f'Cannot save: {error}.')
+            return error
+        self.settings.setValue('query/exportDir', os.path.dirname(path))
+        self.copies[tab] = FileCopy(source, path).start()
+        self.statusBar().showMessage(f'Saving {os.path.basename(path)}…')
+        return None
+
+    def finishSave(self, tab, copy):
+        del self.copies[tab]
+        if copy.error:
+            QMessageBox.critical(self, 'Save as', f'Could not save {copy.path}\n\n{copy.error}')
+            return
+        # The tab may have been closed meanwhile (its widget is gone, so compare without touching it)
+        idx = tab.index if any(self.tabs.widget(i) is tab for i in range(self.tabs.count())) else None
+        if idx and samePath(idx.path, copy.source) and isQueryResult(copy.source):
+            from .sqlviews import defaultTableName
+            options = dict(delimiter=idx.delimiter, encoding=idx.encoding, hasHeader=idx.hasHeader, quoteAware=idx.quoteAware)
+            oldName = tab.tableName
+            if tab.openFile(copy.path, **options):
+                if not tab.namedByUser:  # a name made from the temporary file follows the new file name
+                    tab.tableName = defaultTableName(copy.path, self.tableNames(skip=tab))
+                try:
+                    os.remove(copy.source)
+                except OSError:
+                    pass
+                self.updateTabTitle(tab)
+                self.queryPanel.fileMoved(copy.source, copy.path, oldName, tab.tableName)
+                if tab is self.current():
+                    self.revealInExplorer(tab)
+        self.statusBar().showMessage(f'Saved {copy.path}', 10000)
 
     # ---------- drag & drop / close ----------
 
@@ -1419,6 +1634,9 @@ class MainWindow(QMainWindow):
                 self.openPath(url.toLocalFile())
 
     def closeEvent(self, event):
+        for copy in self.copies.values():
+            copy.cancelled = True  # removes its .part file
+            copy.thread.join()
         self.assistant.shutdown()
         self.queryPanel.shutdown()
         self.mcp.stop()

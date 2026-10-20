@@ -109,6 +109,18 @@ Each file opens in its own tab.
   every row again; **Remove** in the dropdown takes the button away. Columns with more than 50,000
   different values list the first 50,000; type in the search box and press OK to keep every row
   containing that text.
+- **Column functions** — right-click a column header (or a cell):
+  - **Unique rows by "column"** (distinct): keeps the first row of each value, e.g. one row per asset id.
+  - **Only duplicated "column" values**: keeps rows whose value appears more than once.
+  - **Hide rows with blank "column"**.
+  - **Column statistics**: rows, blanks, distinct values, values that repeat, and the sum, average,
+    minimum and maximum of numbers, plus the most common values with their counts (double-click one
+    to filter to it).
+  - **Count rows with "value"** (cell menu): the count appears in the status bar.
+
+  These combine with the other filters and work on the rows on screen; click a ticked entry again
+  to turn it off.
+- **Explorer panel** — selects the file of the tab you are looking at.
 - **Export matching rows** to a new CSV (with column filters on: the filtered rows).
 - **Cell detail panel** — shows the full value of the current cell.
 - **Light / dark theme** — **View ▸ Theme**: System, Light or Dark (Ctrl+Shift+L toggles). The
@@ -170,16 +182,17 @@ Measured on an 11 GB file with 160.6 million rows:
 
 **⊞ Query** (top right) or **Ctrl+Shift+Q** opens the Query tab of the right-hand side panel (next to **✦ Assistant**, Ctrl+Shift+A; the same button or shortcut hides it again). It answers questions about a whole file - no SQL needed:
 
-- **Drag a column header** from the table into the panel, like Studio 3T: drop it on **Filter rows** to filter by it, on **Group & summarize** to group by it, or on **Show columns** to include it (from another tab, the panel switches to that file). Right-click a header ▸ **Filter by / Group by this column in Query** does the same.
+- **Drag a column header** from the table into the panel, like Studio 3T: drop it on **Filter rows** to filter by it, on **Group & summarize** to group by it, or on **Show columns** to include it (from another tab, the panel switches to that file). Right-click a header ▸ **Filter by / Group by this column in Query** does the same, and **Count rows per value in Query** groups by the column with a row count, most rows first, and runs it.
 
-- **File:** pick any open tab.
+- **Table:** every tab is a table with a name shown on the tab (made from the file name, e.g. `sales_2024`). The name stays the same when tabs move or close. Rename it with **✎**, by double-clicking the tab, or right-click the tab ▸ **Rename table…**; the name is remembered for that file, and a renamed tab also shows the file name (e.g. *inventory · assets.csv*).
+- **One query per tab:** the panel follows the tab you are looking at, and each tab keeps its own filters, SQL and last result, so you can work on different files side by side. A query still running when you switch tabs delivers its result to its own tab.
 - **Show columns:** tick the columns you want.
-- **Filter rows:** e.g. *status equals inService*, *amount ≥ 100*, *city contains calg*, *note is empty*; match **all** or **any** of the filters. Text matching ignores case.
+- **Filter rows:** e.g. *status equals inService*, *amount ≥ 100*, *city contains calg*, *note is empty*, *asset_id is one of (IN)* / *is not one of (NOT IN)* a list; match **all** or **any** of the filters. Text matching ignores case. For IN / NOT IN, separate values with commas or paste a copied column (one value per line).
 - **Group & summarize:** one row per group with Count, Count distinct, Sum, Average, Min or Max.
 - **Sort by** a column or summary, **Limit rows**, **Only distinct rows**.
 - **Run** (Ctrl+Enter) runs it with DuckDB over the full file - multi-GB files take seconds; **Stop** cancels.
-- **Export results…** writes the full result to a CSV; **Open results as new tab** opens it in the viewer.
-- The generated SQL is shown live; **Edit SQL** lets you change it by hand (read-only queries only; tab N is view `tN`).
+- **Export results…** writes the full result to a CSV; **Open results as new tab** opens it in the viewer as a temporary file. **Save result as…** (in that tab's bottom bar, the tab's right-click menu, or File ▸ Save as…, Ctrl+Shift+S) saves it under a name and folder you choose, and the tab then shows the saved file. For any other tab, the same command saves a copy.
+- The generated SQL is shown live; **Edit SQL** lets you change it by hand (read-only queries only). Use the table names, join tables freely, and add `_text` (e.g. `sales_text`) for an all-text view. Drag the handle under the SQL box to make it taller; long pasted queries have no length limit.
 
 Needs the `duckdb` package (installed by `./install.sh` / `install-windows.ps1`, included in the standalone builds).
 
@@ -194,6 +207,7 @@ Ask questions about the open tabs in plain language: **✦ Assistant** (top righ
 - **History:** every chat is saved automatically. **◷ History** reopens one (you can keep asking in it), deletes the current chat, or clears all. Chats are stored on this PC only.
 - **⤢** opens the assistant in a larger window for long reports; **⤡** puts it back. You can also drag the panel's edge to make it wider.
 - **What leaves your PC:** only small samples and query results - never the file. Claude works through local tools: list tabs, sample rows, read rows, search, **SQL over the whole file (DuckDB; tab N is view `tN`)**, and jump to rows. Each step shows as a chip you can expand.
+- **Queries in your Query panel:** ask the assistant to write or show a query ("show me a count per city as a query") and it puts the SQL into the Query panel and runs it there, so you get the full result table to change, export or save. It can use the table names shown on the tabs.
 - Answers link rows like *row 7*: click to jump there. **Stop** cancels a running query; **New chat** starts fresh.
 - Requires the `anthropic` and `duckdb` packages: `./install.sh` puts them in `.venv` (Linux), `install-windows.ps1` installs them, and the standalone builds include them. Without them the viewer works and the panel says what is missing.
 
