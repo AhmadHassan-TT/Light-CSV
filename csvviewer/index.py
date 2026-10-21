@@ -15,6 +15,7 @@ SEARCH_CHUNK = 4 << 20  # bytes scanned per search step (small so the UI stays r
 FILTER_CHUNK = 16 << 20  # bytes per column-filter step
 MAX_DISTINCT = 50_000  # a filter list stops collecting new values past this
 MAX_STATS_DISTINCT = 2_000_000  # column statistics stop telling new values apart past this
+MAX_SORT_ROWS = 25_000_000  # sorting keeps every cell of the column in memory, so larger files sort in the Query panel
 CACHE_BLOCKS = 512
 NL, CR, QUOTE = 10, 13, 34
 
@@ -508,6 +509,59 @@ class ColumnStats(ColumnScan):
     def top(self, n=200):
         """[(value, rows)], most rows first."""
         return self.counter.most_common(n)
+
+
+class ColumnSort(ColumnScan):
+    """Order of all data rows by one column: numbers by value when every non-blank cell is a number, otherwise text
+    A → Z ignoring case; blanks always last and ties keep file order. order is the data rows in that order."""
+
+    def __init__(self, index, col, desc=False):
+        super().__init__(index, {})
+        self.col, self.desc = col, desc
+        self.cells = []
+        self.numeric = True
+        self.order = None
+        self.error = None
+
+    def wanted(self):
+        return {self.col}
+
+    def run(self):
+        if self.index.dataRows > MAX_SORT_ROWS:
+            self.error = f'{self.index.dataRows:,} rows is too many to sort here (at most {MAX_SORT_ROWS:,}); use Sort by in the Query panel'
+        else:
+            with open(self.index.path, 'rb') as f:
+                self.scan(f)
+            if not self.cancelled:
+                self.order = self.sort()
+        self.cells = []
+        self.progress = 1.0
+        self.done = True
+
+    def take(self, firstRow, nRows, fields, rows):
+        vals = fields[self.col]
+        self.cells.extend(vals if len(rows) == nRows else [vals[i] for i in rows.tolist()])
+        return True
+
+    def sort(self):
+        cells = self.cells
+        blank = np.fromiter((not v.strip() for v in cells), bool, len(cells))
+        filled = np.flatnonzero(~blank)
+        order = None
+        if self.numeric:
+            try:
+                keys = np.array([float(cells[i]) for i in filled.tolist()], np.float64)
+                keys[np.isnan(keys)] = -np.inf if self.desc else np.inf  # a "nan" cell sorts after the numbers
+                order = filled[np.argsort(-keys if self.desc else keys, kind='stable')]
+            except ValueError:
+                self.numeric = False
+        if order is None:
+            if self.cancelled:
+                return None
+            keys = [cells[i].strip().lower() for i in filled.tolist()]
+            pos = sorted(range(len(keys)), key=keys.__getitem__, reverse=self.desc)
+            order = filled[np.array(pos, np.int64)] if pos else filled
+        return np.concatenate([order, np.flatnonzero(blank)]).astype(np.int64)
 
 
 class Export:

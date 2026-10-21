@@ -17,12 +17,13 @@ from PyQt6.QtWidgets import (
 
 from .explorer import Explorer
 from .filters import FilterPopup
-from .index import ColumnScan, CsvIndex, Export, FileCopy, Search
+from .index import ColumnScan, ColumnSort, CsvIndex, Export, FileCopy, Search
 
 ROW_HEIGHT = 22
 FILTER_BUTTON = 18  # width of the ▾ button on a filtered column's header
 MAX_CELL_CHARS = 500
 MAX_COPY_CELLS = 200_000
+MAX_RECENT = 30  # recently opened files Go to file (Ctrl+P) offers
 # Qt measures the table in 32-bit pixels, so one view holds at most ~97M rows; bigger files are shown in segments
 SEGMENT = 50_000_000
 DELIMITERS = {'Auto': None, 'Comma ,': ',', 'Semicolon ;': ';', 'Tab': '\t', 'Pipe |': '|'}
@@ -105,12 +106,14 @@ class CsvModel(QAbstractTableModel):
         self.base = 0  # first virtual row of the segment on screen
         self.rowMap = None  # rows on screen when filtered or "only matches" is on
         self.filterCols = {}  # col -> True when its dropdown filters rows, False when it shows every row
+        self.sortedBy = None  # (col, desc) the rows on screen are sorted by
 
     def load(self, csv):
         self.beginResetModel()
         self.csv = csv
         self.rowMap = None
         self.filterCols = {}
+        self.sortedBy = None
         self.rows = 0
         self.base = 0
         self.columns = []
@@ -186,7 +189,10 @@ class CsvModel(QAbstractTableModel):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
-            return self.columns[section] if section < len(self.columns) else None
+            if section >= len(self.columns):
+                return None
+            arrow = ' ▼' if self.sortedBy == (section, True) else ' ▲' if self.sortedBy == (section, False) else ''
+            return self.columns[section] + arrow
         return f'{self.dataRow(section) + 1:,}'
 
 
@@ -466,6 +472,10 @@ class CsvTab(QWidget):
         self.tableName = ''  # SQL table name in the Query panel; set by MainWindow, the user can rename it
         self.namedByUser = False  # True once renamed (now or remembered from an earlier rename)
         self.countScans = []  # (scan, message) for "Count rows with …", reported when done
+        self.sortScan = None  # ColumnSort for the sort being made or shown
+        self.sortShown = None  # the finished ColumnSort the rows on screen follow (the last one while a new one runs)
+        self.sortRank = None  # data row -> its place in sortShown's order
+        self.sortPending = False  # sorted rows on screen wait for the filter / search to finish
         self.model = CsvModel()
         self.table = FrozenTable(self.model)
         self.buildSearchBar()
@@ -513,6 +523,14 @@ class CsvTab(QWidget):
         self.clearFiltersBtn.clicked.connect(self.clearFilters)
         self.clearFiltersBtn.hide()
         info.addWidget(self.clearFiltersBtn)
+        self.sortLabel = QLabel('')
+        self.sortLabel.hide()
+        info.addWidget(self.sortLabel)
+        self.clearSortBtn = QToolButton(text='Clear sort')
+        self.clearSortBtn.setToolTip('Show the rows in file order again')
+        self.clearSortBtn.clicked.connect(self.clearSort)
+        self.clearSortBtn.hide()
+        info.addWidget(self.clearSortBtn)
         info.addWidget(self.cellLabel)
         info.addWidget(self.saveBtn)
         info.addWidget(self.progress)
@@ -640,6 +658,7 @@ class CsvTab(QWidget):
         self.onlyMatches.setChecked(False)
         self.matchLabel.setText('')
         self.resetFilters()
+        self.resetSort()
         if self.index:
             self.index.cancelled = True
             if self.indexThread:
@@ -691,6 +710,7 @@ class CsvTab(QWidget):
         self.infoLabel.setText(f'{table}{idx.path}  ·  {humanSize(idx.size)}  ·  {idx.dataRows:,} rows  ·  '
                                f'{self.model.columnCount()} columns  ·  {delim}  ·  {idx.encoding}{state}')
         self.updateFilterStatus()
+        self.updateSort()
         self.reportCounts()
         s = self.search
         if s:
@@ -752,6 +772,9 @@ class CsvTab(QWidget):
     def virtualOf(self, dataRow):
         """Position of a data row on screen; when filtered, the first visible row at or after it."""
         rows = self.model.rowMap
+        if rows is not None and self.sortRank is not None:
+            at = np.flatnonzero(np.asarray(rows) == dataRow)
+            return int(at[0]) if len(at) else 0
         return dataRow if rows is None else bisect_left(rows, dataRow)
 
     def jumpToDataRow(self, dataRow, col=None):
@@ -856,6 +879,8 @@ class CsvTab(QWidget):
                 self.mapPending = True  # the filter rows show until both scans are done
         elif s:
             rows = s.hits
+        if self.sortRank is not None:
+            rows = self.sortedRows(rows)
         self.model.setRowMap(rows)
         if keep is not None:
             self.jumpToDataRow(keep, cur.column())
@@ -946,6 +971,8 @@ class CsvTab(QWidget):
             if any(self.filters.values()):
                 menu.addAction('Clear all filters', self.clearFilters)
             menu.addSeparator()
+            self.sortActions(menu, col)
+            menu.addSeparator()
             self.columnFunctions(menu, col)
             menu.addSeparator()
             menu.addAction(f'Hide "{self.model.columns[col]}"', lambda: self.table.setColumnHidden(col, True))
@@ -977,6 +1004,86 @@ class CsvTab(QWidget):
         menu.addAction(f'Hide rows with blank "{name}"', lambda: self.setFilterFromCell(col, self.excluding(col, b'')))
         menu.addAction('Column statistics (count, distinct, sum)…', lambda: self.columnStats(col))
         menu.setToolTipsVisible(True)
+
+    # ---------- sorting ----------
+
+    def sortActions(self, menu, col):
+        name = self.model.columns[col]
+        for desc, text in ((False, f'Sort A → Z (smallest first) by "{name}"'), (True, f'Sort Z → A (largest first) by "{name}"')):
+            action = menu.addAction(text, lambda d=desc: self.sortBy(col, d))
+            action.setCheckable(True)
+            action.setChecked(self.model.sortedBy == (col, desc))
+        if self.sortScan:
+            menu.addAction('Clear sort', self.clearSort)
+
+    def sortBy(self, col, desc=False):
+        """Show the rows ordered by a column (numbers by value, text ignoring case, blanks last); made in the background."""
+        if not self.index or not self.index.done:
+            self.window.statusBar().showMessage('Sorting works once indexing has finished', 5000)
+            return
+        if self.sortScan and self.sortScan is not self.sortShown:
+            self.sortScan.cancel()
+        if self.model.sortedBy == (col, desc):
+            self.sortScan = self.sortShown
+            self.updateSort()
+            return
+        self.sortScan = ColumnSort(self.index, col, desc).start()
+        self.updateSort()
+
+    def clearSort(self):
+        self.resetSort()
+        self.applyFilter()
+
+    def resetSort(self):
+        if self.sortScan:
+            self.sortScan.cancel()
+        self.sortScan = None
+        self.sortShown = None
+        self.sortRank = None
+        self.sortPending = False
+        self.model.sortedBy = None
+        self.sortLabel.hide()
+        self.clearSortBtn.hide()
+        self.table.refreshFrozen()
+
+    def sortedRows(self, rows):
+        """The rows to show (None = all) in sort order; a filter or search still running is sorted as far as it got."""
+        if rows is None:
+            self.sortPending = False
+            return self.sortShown.order
+        scans = [x for x in (self.filterScan, self.search if self.onlyMatches.isChecked() else None) if x]
+        self.sortPending = not all(x.done for x in scans) or self.mapPending
+        rows = np.asarray(rows if isinstance(rows, np.ndarray) else np.frombuffer(rows[:].tobytes(), np.int64))
+        return rows[np.argsort(self.sortRank[rows], kind='stable')]
+
+    def updateSort(self):
+        """Show a finished sort, re-sort rows a filter or search found since, and keep the label current."""
+        scan = self.sortScan
+        if not scan:
+            return
+        name = self.model.columns[scan.col] if scan.col < len(self.model.columns) else f'column {scan.col + 1}'
+        how = ('Z → A' if scan.desc else 'A → Z') if not scan.done or not scan.numeric else ('largest first' if scan.desc else 'smallest first')
+        if not scan.done:
+            self.sortLabel.setText(f'Sorting by {name} ({how})… {scan.progress:.0%}')
+        elif scan.error:
+            self.window.statusBar().showMessage(scan.error, 10000)
+            self.clearSort()
+            return
+        elif self.sortShown is not scan:
+            rank = np.empty(len(scan.order), np.int64)
+            rank[scan.order] = np.arange(len(scan.order))
+            self.sortShown, self.sortRank = scan, rank
+            self.model.sortedBy = (scan.col, scan.desc)
+            self.applyFilter()
+            self.jumpTo(0, scan.col)
+            self.sortLabel.setText(f'Sorted by {name} {"▼" if scan.desc else "▲"}')
+            self.sortLabel.setToolTip(f'{"Numbers" if scan.numeric else "Text, ignoring case"}, {how}; blank cells last')
+        elif self.sortPending and not self.mapPending:
+            scans = [x for x in (self.filterScan, self.search if self.onlyMatches.isChecked() else None) if x]
+            if all(x.done for x in scans):
+                self.applyFilter()
+        self.sortLabel.show()
+        self.clearSortBtn.show()
 
     def columnStats(self, col):
         if not self.index.done:
@@ -1172,6 +1279,8 @@ class CsvTab(QWidget):
         if spec:
             menu.addAction(f'Clear filter on "{self.model.columns[col]}"', lambda: self.setColumnFilter(col, None))
         menu.addSeparator()
+        self.sortActions(menu, col)
+        menu.addSeparator()
         self.columnFunctions(menu, col)
         menu.exec(view.viewport().mapToGlobal(pos))
 
@@ -1228,7 +1337,7 @@ class MainWindow(QMainWindow):
         newTab.clicked.connect(self.openDialog)
         self.tabs.setCornerWidget(newTab, Qt.Corner.TopRightCorner)
         welcome = QLabel('<h2>CSV Viewer</h2><p>Open a CSV file: double-click one in the Explorer on the left,<br>'
-                         'use File ▸ Open (Ctrl+O), or drag files onto this window.</p>'
+                         'use File ▸ Open (Ctrl+O), Go to file (Ctrl+P), or drag files onto this window.</p>'
                          '<p>Each file opens in its own tab. Ask Claude about them with ✦ Assistant (Ctrl+Shift+A).</p>')
         welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.stack = QStackedWidget()
@@ -1242,7 +1351,8 @@ class MainWindow(QMainWindow):
         self.explorerDock.setWidget(self.explorer)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.explorerDock)
         self.explorerDock.visibilityChanged.connect(lambda on: on and QTimer.singleShot(0, self.revealInExplorer))
-        self.copies = {}  # tab -> FileCopy of a running "Save as" 
+        self.copies = {}  # tab -> FileCopy of a running "Save as"
+        self.quickOpenPopup = None
         # One right-hand side panel with two tabs: the Assistant and the Query builder
         self.sideDock = QDockWidget('Assistant', self)
         self.sideDock.setObjectName('sidepanel')
@@ -1295,6 +1405,7 @@ class MainWindow(QMainWindow):
     def buildMenus(self):
         file = self.menuBar().addMenu('&File')
         self.act(file, '&Open in new tab…', self.openDialog, [QKeySequence.StandardKey.Open, QKeySequence('Ctrl+T')])
+        self.act(file, '&Go to file…', self.quickOpen, 'Ctrl+P')
         self.act(file, 'Reopen with &options…', lambda: self.onTab('reopenWithOptions'), 'Ctrl+Shift+O')
         self.act(file, '&Save as…', lambda: self.saveTabAs(self.current()), 'Ctrl+Shift+S')
         file.addSeparator()
@@ -1406,10 +1517,30 @@ class MainWindow(QMainWindow):
             return
         tab.titleChanged.connect(lambda t=tab: self.updateTabTitle(t))
         tab.tableName, tab.namedByUser = self.tableNameFor(path)
+        if not isQueryResult(path):
+            self.addRecentFile(path)
         i = self.tabs.addTab(tab, tab.title())
         self.tabs.setCurrentIndex(i)
         self.updateTabTitle(tab)
         self.stack.setCurrentIndex(1)
+
+    def quickOpen(self):
+        """Go to file (Ctrl+P): fuzzy-find a file under the Explorer folder, or an open / recent one."""
+        if self.quickOpenPopup is None:
+            from .quickopen import QuickOpen
+            self.quickOpenPopup = QuickOpen(self)
+        self.quickOpenPopup.popup()
+
+    def recentFiles(self):
+        try:
+            files = json.loads(self.settings.value('files/recent', '[]'))
+        except (TypeError, ValueError):
+            files = []
+        return [f for f in files if isinstance(f, str)] if isinstance(files, list) else []
+
+    def addRecentFile(self, path):
+        files = [path] + [f for f in self.recentFiles() if not samePath(f, path)]
+        self.settings.setValue('files/recent', json.dumps(files[:MAX_RECENT]))
 
     def tableNames(self, skip=None):
         return [t.tableName for t in (self.tabs.widget(i) for i in range(self.tabs.count())) if t is not skip and t.tableName]

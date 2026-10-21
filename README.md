@@ -110,6 +110,10 @@ Each file opens in its own tab.
   different values list the first 50,000; type in the search box and press OK to keep every row
   containing that text.
 - **Column functions** — right-click a column header (or a cell):
+  - **Sort A → Z / Sort Z → A**: reorders the rows on screen by that column, like Excel. Numbers sort
+    by value, text ignoring case, and blank cells go last. The header shows ▲ / ▼, and the row
+    numbers stay those of the file. It keeps working with filters and search; **Clear sort** (bottom
+    bar) returns to file order. Files over 25 million rows sort with **Sort by** in the Query panel.
   - **Unique rows by "column"** (distinct): keeps the first row of each value, e.g. one row per asset id.
   - **Only duplicated "column" values**: keeps rows whose value appears more than once.
   - **Hide rows with blank "column"**.
@@ -121,6 +125,10 @@ Each file opens in its own tab.
   These combine with the other filters and work on the rows on screen; click a ticked entry again
   to turn it off.
 - **Explorer panel** — selects the file of the tab you are looking at.
+- **Go to file (Ctrl+P)** — like VS Code's quick open: type parts of a file name (`slsq3` finds
+  `sales_q3_2024.csv`; add a space and a folder part to narrow, e.g. `summary q4`) to search every file under
+  the Explorer folder and its subfolders. Open tabs and recent files come first; ↑ ↓ and Enter open it. Respects
+  **CSV files only**; skips hidden folders and `node_modules`. A full path to a file opens it too.
 - **Export matching rows** to a new CSV (with column filters on: the filtered rows).
 - **Cell detail panel** — shows the full value of the current cell.
 - **Light / dark theme** — **View ▸ Theme**: System, Light or Dark (Ctrl+Shift+L toggles). The
@@ -158,6 +166,7 @@ Each file opens in its own tab.
 
 | Shortcut | Action |
 |---|---|
+| Ctrl+P | Go to file: fuzzy-find a file in the Explorer folder (and its subfolders), or an open / recent one |
 | Ctrl+G | Go to row |
 | Ctrl+Home / Ctrl+End | First / last row |
 | Ctrl+D or double-click a cell | Cell detail panel |
