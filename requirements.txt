@@ -2,5 +2,5 @@ PyQt6>=6.5
 numpy>=1.24
 # Assistant panel (Claude): optional, the viewer works without them
 anthropic>=1.13
-duckdb>=1.4
+duckdb>=1.4,<2  # 2.0 skips rows that fail a cast in a read_csv(ignore_errors) view instead of raising
 # pyinstaller is only needed to build the standalone app (python build.py)
