@@ -108,7 +108,11 @@ def testPopup(shots):
     waitFor(app, lambda: pop.scan.done)
     pop.refresh()
     items = [pop.list.item(i).data(PathRole) for i in range(pop.list.count())]
-    assert len(items) == 1 and same(items[0], os.path.join(root, 'notes.txt')), items
+    # Earlier tests may have left recent files (CI sets XDG_CONFIG_HOME, macOS ignores it): the open tab leads, the rest are recents
+    notes = os.path.join(root, 'notes.txt')
+    recent = [os.path.normcase(os.path.abspath(f)) for f in window.recentFiles()]
+    assert items and same(items[0], notes) and sum(same(i, notes) for i in items) == 1, items
+    assert all(os.path.normcase(os.path.abspath(i)) in recent for i in items[1:]), items
     assert 'type to search' in pop.status.text()
     # Typing ranks fuzzy matches; arrows move, Enter opens
     pop.box.setText('salq3')
