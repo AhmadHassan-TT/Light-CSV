@@ -320,9 +320,9 @@ def sizePanel(app, panel, width, height=820):
         dock.setFloating(True)
         settle(app)
     top = panel.window()
-    for _ in range(5):
+    for attempt in range(20):  # macOS can take a while to apply a big shrink
         top.resize(top.width() + width - panel.width(), top.height() + height - panel.height())
-        settle(app)
+        settle(app, 60 if attempt < 5 else 250)
         if abs(panel.width() - width) <= 2:
             break
     assert abs(panel.width() - width) <= 2, (panel.width(), width)
